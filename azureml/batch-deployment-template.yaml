@@ -1,0 +1,32 @@
+$schema: https://azuremlschemas.azureedge.net/latest/modelBatchDeployment.schema.json
+name: ${BATCH_DEPLOYMENT_NAME}
+description: ${BATCH_DEPLOYMENT_DESC}
+type: model
+endpoint_name: ${BATCH_ENDPOINT_NAME}
+model: azureml:${MODEL_NAME}:${MODEL_VERSION}
+compute: azureml:${COMPUTE_NAME}
+environment: azureml:${ENDPOINT_ENVIRONMENT}
+resources:
+  instance_count: 1
+settings:
+  environment_variables:
+    AZURE_SUBSCRIPTION_ID: ${SUBSCRIPTION_ID}
+    AZURE_RESOURCE_GROUP: ${RG}
+    AZURE_WORKSPACE_NAME: ${WORKSPACE_NAME}
+    FEATURE_DATA_ASSET_NAME: ${FEATURE_DATA_ASSET_NAME}
+    FEATURE_DATA_ASSET_VERSION: "${FEATURE_DATA_ASSET_VERSION}"
+  max_concurrency_per_instance: 1
+  mini_batch_size: 1
+  output_action: append_row
+  output_file_name: predictions.csv
+
+  retry_settings:
+    max_retries: 3
+    timeout: 300
+
+  error_threshold: -1
+  logging_level: debug
+
+code_configuration:
+  code: ..
+  scoring_script: src/score_scripts/${SCORE_SCRIPT}

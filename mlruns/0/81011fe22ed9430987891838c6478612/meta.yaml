@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/81011fe22ed9430987891838c6478612/artifacts
+end_time: 1783109475517
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 81011fe22ed9430987891838c6478612
+run_name: vaunted-swan-141
+run_uuid: 81011fe22ed9430987891838c6478612
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783109473603
+status: 3
+tags: []
+user_id: alisonmcdowell

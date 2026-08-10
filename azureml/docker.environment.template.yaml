@@ -1,0 +1,5 @@
+$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+name: ${TRAINING_ENVIRONMENT_NAME}
+build:
+  path: ../environments/train/. # Path to the folder containing the Dockerfile
+description: Environment built from a custom Dockerfile.

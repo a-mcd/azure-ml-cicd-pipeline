@@ -1,0 +1,31 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+code: ..
+command: >
+  PYTHONPATH=. python src/model_scripts/${{ inputs.script_name }}
+  --training_data ${{ inputs.training_data }}
+  --eta ${{ inputs.eta }}
+  --max_depth ${{ inputs.max_depth }}
+  --n_estimators ${{ inputs.n_estimators }}
+  --subsample ${{ inputs.subsample }}
+  --colsample_bytree ${{ inputs.colsample_bytree }}
+  --reg_alpha ${{ inputs.reg_alpha }}
+  --reg_lambda ${{ inputs.reg_lambda }}
+  ${CHALLENGER_MODEL}
+inputs:
+  script_name: ${SCRIPT_NAME}
+  training_data:
+    type: uri_file
+    path: ${WALMART_SALES_ASSET_URI}
+    mode: ro_mount
+  # Hyperparameters (all numeric)
+  eta: ${ETA}
+  max_depth: ${MAX_DEPTH}
+  n_estimators: ${N_ESTIMATORS}
+  subsample: ${SUBSAMPLE}
+  colsample_bytree: ${COLSAMPLE_BYTREE}
+  reg_alpha: ${REG_ALPHA}
+  reg_lambda: ${REG_LAMBDA}
+environment: azureml:${TRAINING_ENVIRONMENT}
+compute: azureml:${COMPUTE_NAME}
+experiment_name: ${EXPERIMENT_NAME}
+description: ${DESCRIPTION}

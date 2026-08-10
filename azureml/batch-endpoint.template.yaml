@@ -1,0 +1,4 @@
+$schema: https://azuremlschemas.azureedge.net/latest/batchEndpoint.schema.json
+name: ${BATCH_ENDPOINT_NAME}
+description: ${BATCH_ENDPOINT_DESC}
+auth_mode: aad_token

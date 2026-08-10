@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/c3c1056b01b44b55b993815f348e67dc/artifacts
+end_time: 1783117154085
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: c3c1056b01b44b55b993815f348e67dc
+run_name: adorable-snake-411
+run_uuid: c3c1056b01b44b55b993815f348e67dc
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783117151666
+status: 3
+tags: []
+user_id: alisonmcdowell

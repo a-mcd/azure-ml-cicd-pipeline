@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/e8cd0254e8c240cba3f6a203414f449e/artifacts
+end_time: 1783439784844
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: e8cd0254e8c240cba3f6a203414f449e
+run_name: gentle-midge-883
+run_uuid: e8cd0254e8c240cba3f6a203414f449e
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783439775559
+status: 3
+tags: []
+user_id: alisonmcdowell

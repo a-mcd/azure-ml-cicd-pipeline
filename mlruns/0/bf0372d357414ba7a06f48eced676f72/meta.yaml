@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/bf0372d357414ba7a06f48eced676f72/artifacts
+end_time: 1783105485332
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: bf0372d357414ba7a06f48eced676f72
+run_name: colorful-swan-816
+run_uuid: bf0372d357414ba7a06f48eced676f72
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783105484107
+status: 3
+tags: []
+user_id: alisonmcdowell

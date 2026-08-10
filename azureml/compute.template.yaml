@@ -1,0 +1,11 @@
+# compute.template.yaml
+$schema: https://azuremlschemas.azureedge.net/latest/amlCompute.schema.json
+name: ${CLUSTER_NAME}
+type: amlcompute
+size: ${COMPUTE_SIZE}
+min_instances: 0
+max_instances: ${COMPUTE_INSTANCES}
+idle_time_before_scale_down: 120
+tier: dedicated
+identity:
+  type: SystemAssigned

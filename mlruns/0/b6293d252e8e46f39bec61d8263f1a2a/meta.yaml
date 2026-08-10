@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/b6293d252e8e46f39bec61d8263f1a2a/artifacts
+end_time: 1783442041884
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: b6293d252e8e46f39bec61d8263f1a2a
+run_name: gifted-bear-98
+run_uuid: b6293d252e8e46f39bec61d8263f1a2a
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783442041071
+status: 3
+tags: []
+user_id: alisonmcdowell

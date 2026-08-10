@@ -1,0 +1,2438 @@
+####
+# Updates the data with new versions and deploys it to the endpoints
+####
+name: Walmart Data Pipeline - (Data Lake only)
+
+on:
+  workflow_dispatch:
+  
+concurrency:
+  group: walmart-datalake-${{ vars.TEST_PREFIX }}
+  cancel-in-progress: false
+  
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONPATH: ${{ github.workspace }}
+  RESOURCE_PREFIX: "${{ vars.TEST_PREFIX }}"
+  RG: "${{ vars.TEST_PREFIX }}-rg"
+  WORKSPACE_NAME: "${{ vars.TEST_PREFIX }}_workspace"
+  
+
+  PYTHON_VERSION: "3.12"
+
+  # Local source file in the repository.
+  WALMART_SALES_DATASET_PATH: data/Walmart_Sales_Updated5.csv
+
+  # Feature-store configuration.
+  FEATURE_STORE_WS: "${{ vars.TEST_PREFIX }}_fs_ws"
+  FEATURE_SET_NAME: walmart_sales_features
+  FEATURE_SET_VERSION: "1"
+  FEATURE_DATA_ASSET_NAME: "walmart_materialized_features"
+
+  # These values must match FeatureSetSpec.yaml.
+  ADLS_ACCOUNT: "${{ vars.TEST_PREFIX }}walmartlake"
+  ADLS_FILESYSTEM: walmart-source
+  ADLS_VERSION_ROOT: walmart-sales/versions
+  ADLS_FILENAME: Walmart_Sales.csv
+  ADLS_CURRENT_FILE_PATH: walmart-sales/current/Walmart_Sales.csv
+
+  # Exported Azure ML data asset.
+  ENGINEERED_DATA_ASSET_NAME: walmart_materialized_features
+  ENGINEERED_DATA_PATH: data/walmart_materialized_features_all_weeks.csv
+
+  RT_ENDPOINT_PREFIX: "rt-walmart-sales-"
+  BATCH_ENDPOINT_PREFIX: "batch-walmart-sales"
+  ENDPOINT_ENVIRONMENT: "${{ vars.TEST_PREFIX }}-endpoint-env:${{ vars.TEST_ENDPOINT_ENV_VERSION }}"
+
+  MODEL_NAME: "walmart-xgb"
+  ARTIFACT_RETENTION_DAYS: 30
+
+jobs:
+  check-datalake:
+    name: Check datalake storage
+    if: ${{ vars.TEST_STORAGE_TYPE == 'datalake' }}
+    runs-on: ubuntu-latest
+
+    env:
+      STORAGE_TYPE: ${{ vars.TEST_STORAGE_TYPE }}
+
+    steps:
+      - name: Confirm datalake storage
+        run: |
+          set -euo pipefail
+          echo "Storage type is '$STORAGE_TYPE'."
+          echo "Running datalake-specific steps."
+  # ===================================================================
+  # Query the current ADLS versions and determine the next
+  # ===================================================================
+  determine-shared-version:
+    name: Determine next shared data version
+    runs-on: ubuntu-latest
+    needs: [check-datalake]
+    outputs:
+      shared_version: ${{ steps.version.outputs.shared_version }}
+      latest_adls_version: ${{ steps.version.outputs.latest_adls_version }}
+      latest_engineered_version: ${{ steps.version.outputs.latest_engineered_version }}
+      latest_test_data_version: ${{ steps.version.outputs.latest_test_data_version }}
+      adls_file_version_path: ${{ steps.version.outputs.adls_file_version_path }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Install Azure ML CLI extension
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az extension add \
+            --name ml \
+            --upgrade
+
+      - name: Determine next shared data version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Check ADLS versions"
+          # Find the latest numeric ADLS directory.
+          VERSION_DIRECTORIES="$(
+            az storage fs directory list \
+              --account-name "$ADLS_ACCOUNT" \
+              --file-system "$ADLS_FILESYSTEM" \
+              --path "$ADLS_VERSION_ROOT" \
+              --auth-mode login \
+              --query "[?isDirectory == \`true\`].name" \
+              --output tsv
+          )"
+
+          LATEST_ADLS_VERSION="$(
+            awk -F/ '
+              $NF ~ /^[0-9]+$/ {
+                version = $NF + 0
+
+                if (version > maximum) {
+                  maximum = version
+                }
+              }
+              END {
+                print maximum + 0
+              }
+            ' <<< "$VERSION_DIRECTORIES"
+          )"
+          echo "::endgroup::"
+
+          echo "::group::Check engineered-data asset versions"
+          # Find the latest numeric engineered-data asset version.
+          ENGINEERED_VERSIONS="$(
+            az ml data list \
+              --name "$ENGINEERED_DATA_ASSET_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query "[].version" \
+              --output tsv
+          )"
+
+          LATEST_ENGINEERED_VERSION="$(
+            awk '
+              /^[0-9]+$/ {
+                version = $1 + 0
+
+                if (version > maximum) {
+                  maximum = version
+                }
+              }
+              END {
+                print maximum + 0
+              }
+            ' <<< "$ENGINEERED_VERSIONS"
+          )"
+          echo "::endgroup::"
+          
+          echo "::group::Check test-data asset versions"
+          # Find the latest numeric test-data asset version.
+          TEST_DATA_VERSIONS="$(
+            az ml data list \
+              --name "test_data" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query "[].version" \
+              --output tsv
+          )"
+
+          LATEST_TEST_DATA_VERSION="$(
+            awk '
+              /^[0-9]+$/ {
+                version = $1 + 0
+
+                if (version > maximum) {
+                  maximum = version
+                }
+              }
+              END {
+                print maximum + 0
+              }
+            ' <<< "$TEST_DATA_VERSIONS"
+          )"
+          echo "::endgroup::"
+
+          echo "::group::Calculate next shared version"
+          # Choose a version that does not already exist in either place.
+          LATEST_SHARED_VERSION="$(
+            printf '%s\n' \
+              "$LATEST_ADLS_VERSION" \
+              "$LATEST_ENGINEERED_VERSION" \
+              "$LATEST_TEST_DATA_VERSION" |
+              sort -n |
+              tail -n 1
+          )"
+
+          SHARED_VERSION=$((LATEST_SHARED_VERSION + 1))
+          ADLS_FILE_VERSION_PATH="${ADLS_VERSION_ROOT}/${SHARED_VERSION}/${ADLS_FILENAME}"
+
+          {
+            echo "shared_version=$SHARED_VERSION"
+            echo "latest_adls_version=$LATEST_ADLS_VERSION"
+            echo "latest_engineered_version=$LATEST_ENGINEERED_VERSION"
+            echo "latest_test_data_version=$LATEST_TEST_DATA_VERSION"
+            echo "adls_file_version_path=$ADLS_FILE_VERSION_PATH"
+          } >> "$GITHUB_OUTPUT"
+
+          echo ">>> Latest ADLS version:            $LATEST_ADLS_VERSION"
+          echo ">>> Latest engineered-data version: $LATEST_ENGINEERED_VERSION"
+          echo ">>> Latest test-data version:       $LATEST_TEST_DATA_VERSION"
+          echo ">>> Next shared version:            $SHARED_VERSION"
+          echo ">>> New ADLS path:                  $ADLS_FILE_VERSION_PATH"
+          echo "::endgroup::"
+
+          echo "::group::Set job outputs"
+
+          {
+            echo "shared_version=$SHARED_VERSION"
+            echo "latest_adls_version=$LATEST_ADLS_VERSION"
+            echo "latest_engineered_version=$LATEST_ENGINEERED_VERSION"
+            echo "latest_test_data_version=$LATEST_TEST_DATA_VERSION"
+            echo "adls_file_version_path=$ADLS_FILE_VERSION_PATH"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Outputs successfully set."
+          echo "::endgroup::"
+
+
+          {
+            echo "## Shared data version"
+            echo
+            echo "| Location | Latest version |"
+            echo "|---|---:|"
+            echo "| ADLS | \`$LATEST_ADLS_VERSION\` |"
+            echo "| Engineered data | \`$LATEST_ENGINEERED_VERSION\` |"
+            echo "| Test data | \`$LATEST_TEST_DATA_VERSION\` |"
+            echo
+            echo "### New version"
+            echo
+            echo "- **Shared version:** \`$SHARED_VERSION\`"
+            echo "- **ADLS path:** \`$ADLS_FILE_VERSION_PATH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+  # ===================================================================
+  # Validate and upload the updated source CSV to Data Lake.
+  # ===================================================================
+  update-datalake:
+    name: Update Walmart Data Lake source
+    runs-on: ubuntu-latest
+    needs: determine-shared-version
+    timeout-minutes: 30
+    env:
+      ADLS_VERSION: ${{ needs.determine-shared-version.outputs.shared_version }}
+      ADLS_FILE_VERSION_PATH: ${{ needs.determine-shared-version.outputs.adls_file_version_path }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Validate environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$ADLS_ACCOUNT" =~ ^[a-z0-9]{3,24}$ ]]; then
+            echo "::error title=Invalid storage account::$ADLS_ACCOUNT must contain 3-24 lowercase letters or numbers"
+            exit 1
+          fi
+
+          echo ">>> Resource group:       $RG"
+          echo ">>> Workspace:            $WORKSPACE_NAME"
+          echo ">>> Feature-store:        $FEATURE_STORE_WS"
+          echo ">>> Data Lake account:    $ADLS_ACCOUNT"
+          echo ">>> Data Lake filesystem: $ADLS_FILESYSTEM"
+          echo ">>> Data Lake path:       $ADLS_FILE_VERSION_PATH"
+
+      - name: Validate new source data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$WALMART_SALES_DATASET_PATH" ]]; then
+            echo "::error title=Missing source file::$WALMART_SALES_DATASET_PATH does not exist"
+            exit 1
+          fi
+
+          if [[ ! -s "$WALMART_SALES_DATASET_PATH" ]]; then
+            echo "::error title=Empty source file::$WALMART_SALES_DATASET_PATH is empty"
+            exit 1
+          fi
+
+          python - "$WALMART_SALES_DATASET_PATH" <<'PYTHON'
+          import sys
+
+          import pandas as pd
+
+          source_path = sys.argv[1]
+          dataframe = pd.read_csv(source_path)
+
+          required_columns = {
+              "Store",
+              "Date",
+              "Weekly_Sales",
+              "Holiday_Flag",
+              "Temperature",
+              "Fuel_Price",
+              "CPI",
+              "Unemployment",
+          }
+
+          missing_columns = sorted(
+              required_columns.difference(dataframe.columns)
+          )
+
+          if missing_columns:
+              raise RuntimeError(
+                  "The source CSV is missing required columns: "
+                  + ", ".join(missing_columns)
+              )
+
+          if dataframe.empty:
+              raise RuntimeError("The source CSV contains no data rows.")
+
+          dataframe["Date"] = pd.to_datetime(
+              dataframe["Date"],
+              format="%d-%m-%Y",
+              errors="raise",
+          )
+
+          duplicate_count = dataframe.duplicated(
+              subset=["Store", "Date"]
+          ).sum()
+
+          if duplicate_count:
+              raise RuntimeError(
+                  f"The source CSV contains {duplicate_count} duplicate "
+                  "Store/Date rows."
+              )
+
+          print(f"Rows: {len(dataframe)}")
+          print(f"Stores: {dataframe['Store'].nunique()}")
+          print(f"Minimum date: {dataframe['Date'].min():%d-%m-%Y}")
+          print(f"Maximum date: {dataframe['Date'].max():%d-%m-%Y}")
+          PYTHON
+
+      - name: Upload updated versioned data to Data Lake
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo ">>> Uploading updated Walmart sales data."
+          echo ">>> Storage account: $ADLS_ACCOUNT"
+          echo ">>> Filesystem:      $ADLS_FILESYSTEM"
+          echo ">>> Destination:     $ADLS_FILE_VERSION_PATH"
+          echo ">>> Source:          $WALMART_SALES_DATASET_PATH"
+
+          az storage fs file upload \
+            --account-name "$ADLS_ACCOUNT" \
+            --file-system "$ADLS_FILESYSTEM" \
+            --path "$ADLS_FILE_VERSION_PATH" \
+            --source "$WALMART_SALES_DATASET_PATH" \
+            --overwrite false \
+            --auth-mode login \
+            --only-show-errors
+
+          echo "::notice title=Data Lake updated::$ADLS_FILE_VERSION_PATH"
+
+      - name: Verify versioned Data Lake file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAX_ATTEMPTS=20
+          
+          LOCAL_FILE_SIZE="$(
+            stat --format='%s' "$WALMART_SALES_DATASET_PATH"
+          )"
+
+          echo "Path:                $ADLS_FILE_VERSION_PATH"
+          echo "Expected size:       $LOCAL_FILE_SIZE bytes"
+          echo "Maximum attempts:    $MAX_ATTEMPTS"
+          echo "Retry interval:      30 seconds"
+
+          for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+            if FILE_DETAILS="$(
+              az storage fs file show \
+                --account-name "$ADLS_ACCOUNT" \
+                --file-system "$ADLS_FILESYSTEM" \
+                --path "$ADLS_FILE_VERSION_PATH" \
+                --auth-mode login \
+                --output json 2>/dev/null
+            )"; then
+              REMOTE_FILE_SIZE="$(
+                jq -r '.size' <<< "$FILE_DETAILS"
+              )"
+
+              echo ">>> Local file size:  $LOCAL_FILE_SIZE bytes"
+              echo ">>> Remote file size: $REMOTE_FILE_SIZE bytes"
+
+              if [[ "$REMOTE_FILE_SIZE" == "$LOCAL_FILE_SIZE" ]]; then
+                echo ">>> Updated Data Lake file has the expected size."
+
+                echo "$FILE_DETAILS" |
+                  jq '{
+                    path: .name,
+                    size: .contentLength,
+                    lastModified: .lastModified
+                  }'
+
+                exit 0
+              fi
+
+              echo ">>> Existing versioned Data Lake file does not yet have the expected size."
+            fi
+
+            echo ">>> Waiting for updated versioned Data Lake file: attempt $attempt/$MAX_ATTEMPTS"
+            sleep 30
+          done
+
+          echo "::error title=Data Lake verification failed::$ADLS_FILE_VERSION_PATH is missing, inaccessible, or has the wrong size"
+          exit 1
+
+      - name: Update current Data Lake file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az storage fs file upload \
+            --account-name "$ADLS_ACCOUNT" \
+            --file-system "$ADLS_FILESYSTEM" \
+            --path "$ADLS_CURRENT_FILE_PATH" \
+            --source "$WALMART_SALES_DATASET_PATH" \
+            --overwrite true \
+            --auth-mode login \
+            --only-show-errors
+
+          az storage fs file show \
+            --account-name "$ADLS_ACCOUNT" \
+            --file-system "$ADLS_FILESYSTEM" \
+            --path "$ADLS_CURRENT_FILE_PATH" \
+            --auth-mode login \
+            --output table
+
+      - name: Verify current Data Lake file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAX_ATTEMPTS=20
+
+          LOCAL_FILE_SIZE="$(
+            stat --format='%s' "$WALMART_SALES_DATASET_PATH"
+          )"
+
+          for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+            if FILE_DETAILS="$(
+              az storage fs file show \
+                --account-name "$ADLS_ACCOUNT" \
+                --file-system "$ADLS_FILESYSTEM" \
+                --path "$ADLS_CURRENT_FILE_PATH" \
+                --auth-mode login \
+                --output json 2>/dev/null
+            )"; then
+              REMOTE_FILE_SIZE="$(
+                jq -r '.size' <<< "$FILE_DETAILS"
+              )"
+
+              echo ">>> Local file size:  $LOCAL_FILE_SIZE bytes"
+              echo ">>> Remote file size: $REMOTE_FILE_SIZE bytes"
+
+              if [[ "$REMOTE_FILE_SIZE" == "$LOCAL_FILE_SIZE" ]]; then
+                echo ">>> Updated Data Lake file has the expected size."
+
+                echo "$FILE_DETAILS" |
+                  jq '{
+                    path: .name,
+                    size: .contentLength,
+                    lastModified: .lastModified
+                  }'
+
+                exit 0
+              fi
+
+              echo ">>> Existing current Data Lake file does not yet have the expected size."
+            fi
+
+            echo ">>> Waiting for updated current Data Lake file: attempt $attempt/$MAX_ATTEMPTS"
+            if (( attempt < MAX_ATTEMPTS )); then
+              echo "Waiting 30 seconds before retry..."
+              sleep 30
+            fi
+          done
+
+          echo "::error title=Data Lake verification failed::$ADLS_CURRENT_FILE_PATH is missing, inaccessible, or has the wrong size"
+          exit 1
+      - name: Create Data Lake update summary
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE_SIZE="$(
+            stat --format='%s' "$WALMART_SALES_DATASET_PATH"
+          )"
+
+          {
+            echo "## Walmart Data Lake update"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Shared version | \`$ADLS_VERSION\` |"
+            echo "| Storage account | \`$ADLS_ACCOUNT\` |"
+            echo "| Filesystem | \`$ADLS_FILESYSTEM\` |"
+            echo "| Source file | \`$WALMART_SALES_DATASET_PATH\` |"
+            echo "| File size | \`$FILE_SIZE bytes\` |"
+            echo "| Versioned path | \`$ADLS_FILE_VERSION_PATH\` |"
+            echo "| Current path | \`$ADLS_CURRENT_FILE_PATH\` |"
+            echo
+            echo "Versioned and current Data Lake files uploaded and verified."
+          } >> "$GITHUB_STEP_SUMMARY"
+  # ===================================================================
+  # Get required materialisation dates
+  # - Start date: the last date materialised
+  # - End date: last date in the updated CSV
+  # ===================================================================
+  retrieve-required-dates:
+    name: Get start and end date to be materialised
+    runs-on: ubuntu-latest
+    needs: [check-datalake]
+    outputs:
+      end_date: ${{ steps.set-end-date.outputs.end-date }}
+      start_date: ${{ steps.set-start-date.outputs.start-date }}
+      latestdate: ${{ steps.set-end-date.outputs.latestdate }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      
+      - name: Install Python dependencies and verify java
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Install Python dependencies"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade setuptools
+          python3 -m pip install -r requirements.txt
+          echo "::endgroup::"
+
+          echo "::group::Verify Python environment"
+          python3 --version
+          # Verify the compatibility module required by this PySpark version.
+          python3 -c "from distutils.version import LooseVersion; print('distutils compatibility is available')"
+          echo "::endgroup::"
+
+          echo "::group::Verify Java environment"
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "::endgroup::"
+
+      - name: Get end date from uploaded file
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Source file: $WALMART_SALES_DATASET_PATH"
+          python3 src/pipeline_scripts/get_latest_date_csv.py --file $WALMART_SALES_DATASET_PATH --github_env
+
+      - name: Set materialisation end date
+        shell: bash
+        id: set-end-date
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${LATEST_DATE:-}" ]]; then
+            echo "::error::LATEST_DATE is not set or is empty."
+            exit 1
+          fi
+
+          echo "LATEST_DATE is set: $LATEST_DATE"
+          echo "MATERIALISATION_END_DATE is set: $MATERIALISATION_END_DATE"
+
+
+          echo "latestdate=$LATEST_DATE" >> "$GITHUB_OUTPUT"
+          echo "end-date=$MATERIALISATION_END_DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Get last processed date
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Discover feature-store offline storage"
+          SUBSCRIPTION_ID="$(
+              az account show \
+                  --query id \
+                  --output tsv
+          )"
+
+          FEATURE_STORE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG}/providers/Microsoft.MachineLearningServices/workspaces/${FEATURE_STORE_WS}"
+
+          FEATURE_STORE_STORAGE_ID="$(
+            az resource show \
+                --ids "$FEATURE_STORE_ID" \
+                --query properties.storageAccount \
+                --output tsv
+          )"
+
+          OFFLINE_STORE_SCOPE="$(
+            az ml feature-store show \
+                --name "$FEATURE_STORE_WS" \
+                --resource-group "$RG" \
+                --query offline_store.target \
+                --output tsv
+          )"
+
+          # Extract the names from their Azure resource IDs.
+          export OFFLINE_STORAGE_ACCOUNT="${FEATURE_STORE_STORAGE_ID##*/}"
+          export OFFLINE_STORAGE_CONTAINER="${OFFLINE_STORE_SCOPE##*/}"
+
+          echo "Offline storage account: $OFFLINE_STORAGE_ACCOUNT"
+          echo "Offline storage container: $OFFLINE_STORAGE_CONTAINER"
+          echo "::endgroup::"
+
+          echo "::group::Retrieve offline storage credentials"
+          export AZURE_STORAGE_KEY="$(
+              az storage account keys list \
+                  --resource-group "$RG" \
+                  --account-name "$OFFLINE_STORAGE_ACCOUNT" \
+                  --query "[0].value" \
+                  --output tsv
+          )"
+
+          if [[ -z "${AZURE_STORAGE_KEY:-}" || \
+                "$AZURE_STORAGE_KEY" == "null" ]]; then
+              echo "ERROR: Could not retrieve the feature-store storage key." >&2
+              exit 1
+          fi
+          echo "Storage credentials retrieved successfully."
+          echo "::endgroup::"
+
+           echo "::group::Read latest materialised date"
+          python3 src/pipeline_scripts/get_latest_materialised_date.py  --github-env
+           echo "::endgroup::"
+
+      
+      - name: Set materialisation start date
+        shell: bash
+        id: set-start-date
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${LATEST_PROCESSED_DATE:-}" ]]; then
+            echo "::error::LATEST_PROCESSED_DATE is not set or is empty."
+            exit 1
+          fi
+
+          echo "LATEST_PROCESSED_DATE is set: $LATEST_PROCESSED_DATE"
+          echo "start-date=$LATEST_PROCESSED_DATE" >> "$GITHUB_OUTPUT" 
+      
+      - name: Create materialisation summary
+        shell: bash
+        env:
+          START_DATE: ${{ steps.set-start-date.outputs.start-date }}
+          END_DATE: ${{ steps.set-end-date.outputs.end-date }}
+          LATEST_DATE: ${{ steps.set-end-date.outputs.latestdate }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Feature materialisation dates"
+            echo
+            echo "| Date | Value |"
+            echo "|---|---|"
+            echo "| Latest source-data date | \`$LATEST_DATE\` |"
+            echo "| Latest materialised date | \`$START_DATE\` |"
+            echo "| Reqiured Materialisation end date | \`$END_DATE\` |"
+            echo
+            echo "### Materialisation window"
+            echo
+            echo "\`$START_DATE\` → \`$END_DATE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+  # ===================================================================
+  # Submit materialization and wait for every resulting job.
+  # ===================================================================
+  materialize-features:
+    name: Materialize updated Walmart features
+    needs: [update-datalake, retrieve-required-dates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      END_DATE: ${{ needs.retrieve-required-dates.outputs.end_date }}
+      START_DATE: ${{ needs.retrieve-required-dates.outputs.start_date }}
+      LATEST_DATE: ${{ needs.retrieve-required-dates.outputs.latestdate }}
+    outputs:
+      job_count: ${{ steps.submit-materialization.outputs.job_count }}
+      job_ids: ${{ steps.submit-materialization.outputs.job_ids }}
+
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Install Azure ML CLI extension
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az extension add \
+            --name ml \
+            --upgrade
+
+      - name: Submit feature-store materialization
+        id: submit-materialization
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo ">>> Feature-store: $FEATURE_STORE_WS"
+          echo ">>> Feature set:   $FEATURE_SET_NAME:$FEATURE_SET_VERSION"
+          echo ">>> Start date:    $START_DATE"
+          echo ">>> Latest date:   $LATEST_DATE"
+          echo ">>> End date:      $END_DATE"
+
+          echo "::group::Convert materialization window"
+          START_DATE_ISO="$(
+            python3 -c \
+              'from datetime import datetime; import sys; print(datetime.strptime(sys.argv[1], "%d-%m-%Y").strftime("%Y-%m-%dT%H:%M:%SZ"))' \
+              "$START_DATE"
+          )"
+
+          END_DATE_ISO="$(
+            python3 -c \
+              'from datetime import datetime; import sys; print(datetime.strptime(sys.argv[1], "%d-%m-%Y").strftime("%Y-%m-%dT%H:%M:%SZ"))' \
+              "$END_DATE"
+          )"
+          echo "Materialization window:"
+          echo "  $START_DATE -> $START_DATE_ISO"
+          echo "  $END_DATE   -> $END_DATE_ISO"
+          echo "::endgroup::"
+
+
+          echo "::group::Submit materialization request"
+            echo ">>> Submitting feature-store materialization."
+
+            BACKFILL_RESP=$(az ml feature-set backfill \
+              --name "$FEATURE_SET_NAME" \
+              --version "$FEATURE_SET_VERSION" \
+              --feature-store-name "$FEATURE_STORE_WS" \
+              --resource-group "$RG" \
+              --feature-window-start-time "$START_DATE_ISO" \
+              --feature-window-end-time "$END_DATE_ISO" \
+              --by-data-status '["None","Incomplete"]' \
+              --output json)
+
+            JOB_IDS="$(jq -c '.jobIds // []' <<< "$BACKFILL_RESP")"
+            JOB_COUNT="$(jq 'length' <<< "$JOB_IDS")"
+
+            echo "Created materialization jobs: $JOB_COUNT"
+            echo "Job IDs: $JOB_IDS"
+
+            check_active_jobs_required=false
+            # The latest source date has already been materialized and there are
+            # no existing active jobs to wait for.
+            if [[ "$START_DATE" != "$LATEST_DATE" && "$JOB_COUNT" -eq 0 ]]; then
+              echo "Active jobs need to be checked as:"
+              echo "- Start date $START_DATE != latest date $LATEST_DATE"
+              echo "- Job count $JOB_COUNT equals 0."
+              check_active_jobs_required=true
+            fi
+            echo "::endgroup::"
+
+            echo "::group::Check active materialization jobs"
+
+            if [[ "$check_active_jobs_required" == true ]]; then
+
+              echo "No new jobs were returned by the backfill request."
+              echo "Checking for existing active materialization jobs as:."
+
+              ACTIVE_JOB_IDS="$(
+                az ml job list \
+                  --resource-group "$RG" \
+                  --workspace-name "$FEATURE_STORE_WS" \
+                  --query "[?starts_with(name, 'fs-mat-') && contains(['NotStarted','Starting','Preparing','Queued','Running','Finalizing'], status)].name" \
+                  --output tsv
+              )"
+
+              MATCHING_JOB_IDS='[]'
+
+              if [[ -z "$ACTIVE_JOB_IDS" ]]; then
+                echo "No active materialization jobs found."
+              else
+                echo "Active materialization jobs:"
+                echo "$ACTIVE_JOB_IDS"
+
+                while IFS= read -r JOB_ID; do
+                  [[ -z "$JOB_ID" ]] && continue
+
+                  echo
+                  echo "Checking job: $JOB_ID"
+
+                  JOB_ARGS="$(
+                    az ml job show \
+                      --name "$JOB_ID" \
+                      --resource-group "$RG" \
+                      --workspace-name "$FEATURE_STORE_WS" \
+                      --query args \
+                      --output tsv
+                  )"
+
+                  JOB_FEATURE_STORE="$(
+                    sed -n 's/.*--featurestore-name \([^ ]*\).*/\1/p' <<< "$JOB_ARGS"
+                  )"
+
+                  JOB_FEATURE_SET="$(
+                    sed -n 's/.*--featureset-name \([^ ]*\).*/\1/p' <<< "$JOB_ARGS"
+                  )"
+
+                  JOB_FEATURE_SET_VERSION="$(
+                    sed -n 's/.*--featureset-version \([^ ]*\).*/\1/p' <<< "$JOB_ARGS"
+                  )"
+
+                  echo "Job:"
+                  echo "  Feature store: $JOB_FEATURE_STORE"
+                  echo "  Feature set:   $JOB_FEATURE_SET"
+                  echo "  Version:       $JOB_FEATURE_SET_VERSION"
+
+                  if [[ "$JOB_FEATURE_STORE" == "$FEATURE_STORE_WS" &&
+                        "$JOB_FEATURE_SET" == "$FEATURE_SET_NAME" &&
+                        "$JOB_FEATURE_SET_VERSION" == "$FEATURE_SET_VERSION" ]]; then
+
+                    echo ">>> Matching active materialization job found: $JOB_ID"
+
+                    MATCHING_JOB_IDS="$(
+                      jq -c \
+                        --arg job_id "$JOB_ID" \
+                        '. + [$job_id]' \
+                        <<< "$MATCHING_JOB_IDS"
+                    )"
+                  else
+                    echo "Job belongs to a different feature set."
+                  fi
+
+                done <<< "$ACTIVE_JOB_IDS"
+              fi
+
+              MATCHING_JOB_COUNT="$(jq 'length' <<< "$MATCHING_JOB_IDS")"
+
+              echo
+              echo "Matching active jobs: $MATCHING_JOB_COUNT"
+              echo "Job IDs: $MATCHING_JOB_IDS"
+
+              if [[ "$MATCHING_JOB_COUNT" -eq 0 ]]; then
+                echo "::error title=Missing materialization job::Backfill returned no job IDs and no matching active materialization jobs were found."
+                exit 1
+              fi
+
+              JOB_IDS="$MATCHING_JOB_IDS"
+              JOB_COUNT="$MATCHING_JOB_COUNT"
+
+            else
+              echo "Active-job check not required as either:"
+              echo "- Job count $JOB_COUNT does not equal 0"
+              echo "- Start date $START_DATE and latest date $LATEST_DATE are equal"
+            fi
+
+            echo "::endgroup::"
+
+            
+          echo "::group::Materialization result"
+
+          echo "Materialization jobs to monitor: $JOB_COUNT"
+          echo "Job IDs: $JOB_IDS"
+
+          {
+            echo "job_ids=$JOB_IDS"
+            echo "job_count=$JOB_COUNT"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::endgroup::"
+
+      - name: Wait for materialization
+        if: steps.submit-materialization.outputs.job_count != '0'
+        shell: bash
+        timeout-minutes: 120
+        env:
+          MATERIALIZATION_JOB_IDS_JSON: ${{ steps.submit-materialization.outputs.job_ids }}
+        run: |
+          set -euo pipefail
+
+          info() {
+            echo ">>> $*"
+          }
+
+          mapfile -t MATERIALIZATION_JOB_IDS < <(
+            jq -r '.[]' <<< "$MATERIALIZATION_JOB_IDS_JSON"
+          )
+
+          if [[ "${#MATERIALIZATION_JOB_IDS[@]}" -eq 0 ]]; then
+            echo "::error title=Missing materialization jobs::No job IDs were provided"
+            exit 1
+          fi
+
+          info "Waiting for ${#MATERIALIZATION_JOB_IDS[@]} materialization job(s)."
+
+          for JOB_ID in "${MATERIALIZATION_JOB_IDS[@]}"; do
+            info "Waiting for materialization job: $JOB_ID"
+
+            while true; do
+              JOB_STATUS="$(
+                az ml job show \
+                  --name "$JOB_ID" \
+                  --resource-group "$RG" \
+                  --workspace-name "$FEATURE_STORE_WS" \
+                  --query status \
+                  --output tsv
+              )"
+
+              info "Materialization job $JOB_ID status: $JOB_STATUS"
+
+              case "$JOB_STATUS" in
+                Completed)
+                  info "Materialization completed successfully: $JOB_ID"
+                  break
+                  ;;
+
+                Failed|Canceled|Cancelled)
+                  echo "::error title=Materialization failed::$JOB_ID finished with status $JOB_STATUS"
+
+                  echo ">>> Materialization job details:"
+
+                  az ml job show \
+                    --name "$JOB_ID" \
+                    --resource-group "$RG" \
+                    --workspace-name "$FEATURE_STORE_WS" \
+                    --output yaml || true
+
+                  echo ">>> Materialization job logs:"
+
+                  az ml job stream \
+                    --name "$JOB_ID" \
+                    --resource-group "$RG" \
+                    --workspace-name "$FEATURE_STORE_WS" \
+                    2>&1 || true
+
+                  exit 1
+                  ;;
+
+                NotStarted|Starting|Preparing|Queued|Running|Finalizing)
+                  sleep 30
+                  ;;
+
+                *)
+                  info "Status '$JOB_STATUS' is not terminal; checking again."
+                  sleep 30
+                  ;;
+              esac
+            done
+          done
+      - name: Create materialization summary
+        if: success()
+        shell: bash
+        env:
+          JOB_COUNT: ${{ steps.submit-materialization.outputs.job_count }}
+          JOB_IDS: ${{ steps.submit-materialization.outputs.job_ids }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Feature materialization"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Feature store | \`$FEATURE_STORE_WS\` |"
+            echo "| Feature set | \`$FEATURE_SET_NAME:$FEATURE_SET_VERSION\` |"
+            echo "| Start date | \`$START_DATE\` |"
+            echo "| Latest source date | \`$LATEST_DATE\` |"
+            echo "| End date | \`$END_DATE\` |"
+            echo "| Materialization jobs | \`$JOB_COUNT\` |"
+            echo
+
+            if [[ "$JOB_COUNT" == "0" ]]; then
+              echo "No feature materialization was required."
+            else
+              echo "### Jobs"
+              echo
+
+              jq -r '.[] | "- `\(.)` Completed"' <<< "$JOB_IDS"
+
+              echo
+              echo "Feature materialization completed successfully."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+  # ===================================================================
+  # - Upload the Engineered data dataset
+  # ===================================================================
+  register-engineered-data:
+    name: Register latest materialized Walmart features
+    needs: [materialize-features, determine-shared-version, retrieve-required-dates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ENGINEERED_DATA_VERSION: ${{ needs.determine-shared-version.outputs.shared_version }}
+      LATEST_PROCESSED_DATE: ${{ needs.retrieve-required-dates.outputs.latestdate }}
+    outputs:
+      asset_uri: ${{ steps.register-engineered-data.outputs.asset_uri }}
+      asset_version: ${{ steps.register-engineered-data.outputs.asset_version }}
+      row_count: ${{ steps.export-features.outputs.row_count }}
+      store_count: ${{ steps.export-features.outputs.store_count }}
+      minimum_date: ${{ steps.export-features.outputs.minimum_date }}
+      maximum_date: ${{ steps.export-features.outputs.maximum_date }}   
+      test_data_uri: ${{ steps.register-test-data.outputs.test_data_uri }} 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Install Azure ML CLI extension
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az extension add \
+            --name ml \
+            --upgrade
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies and verify java 
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Install Python dependencies"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade setuptools
+          python3 -m pip install -r requirements.txt
+
+           echo "::group::Verify runtime environment"
+          python3 --version
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
+
+          python3 -c \
+            "from distutils.version import LooseVersion; print('distutils compatibility: OK')"
+
+          echo "::endgroup::"
+
+      - name: Export all weeks of materialized features
+        id: export-features
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Export configuration"
+
+          echo "Resource group:        $RG"
+          echo "Feature store:         $FEATURE_STORE_WS"
+          echo "Feature set:           $FEATURE_SET_NAME:$FEATURE_SET_VERSION"
+          echo "Export destination:    $ENGINEERED_DATA_PATH"
+          echo "Asset version:         $ENGINEERED_DATA_VERSION"
+
+          echo "::endgroup::"
+
+          echo "::group::Discover feature-store offline storage"
+          rm -f "$ENGINEERED_DATA_PATH"
+
+          
+          SUBSCRIPTION_ID="$(
+              az account show \
+                  --query id \
+                  --output tsv
+          )"
+
+          FEATURE_STORE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG}/providers/Microsoft.MachineLearningServices/workspaces/${FEATURE_STORE_WS}"
+
+          FEATURE_STORE_STORAGE_ID="$(
+              az resource show \
+                  --ids "$FEATURE_STORE_ID" \
+                  --query properties.storageAccount \
+                  --output tsv
+          )"
+
+          OFFLINE_STORE_SCOPE="$(
+              az ml feature-store show \
+                  --name "$FEATURE_STORE_WS" \
+                  --resource-group "$RG" \
+                  --query offline_store.target \
+                  --output tsv
+          )"
+
+          if [[ -z "$FEATURE_STORE_STORAGE_ID" || \
+                "$FEATURE_STORE_STORAGE_ID" == "null" ]]; then
+              echo "ERROR: Could not determine the feature-store storage resource ID." >&2
+              exit 1
+          fi
+
+          if [[ -z "$OFFLINE_STORE_SCOPE" ||
+                "$OFFLINE_STORE_SCOPE" == "null" ]]; then
+              echo "ERROR: Could not determine the offline-store container." >&2
+              exit 1
+          fi
+
+          # Extract the names from their Azure resource IDs.
+          export OFFLINE_STORAGE_ACCOUNT="${FEATURE_STORE_STORAGE_ID##*/}"
+          export OFFLINE_STORAGE_CONTAINER="${OFFLINE_STORE_SCOPE##*/}"
+
+          echo "Offline storage account: $OFFLINE_STORAGE_ACCOUNT"
+          echo "Offline storage container: $OFFLINE_STORAGE_CONTAINER"
+          echo "::endgroup::"
+
+          echo "::group::Retrieve offline-storage credentials"
+          export AZURE_STORAGE_KEY="$(
+              az storage account keys list \
+                  --resource-group "$RG" \
+                  --account-name "$OFFLINE_STORAGE_ACCOUNT" \
+                  --query "[0].value" \
+                  --output tsv
+          )"
+          echo "::add-mask::$AZURE_STORAGE_KEY"
+
+          if [[ -z "${AZURE_STORAGE_KEY:-}" || \
+                "$AZURE_STORAGE_KEY" == "null" ]]; then
+              echo "ERROR: Could not retrieve the feature-store storage key." >&2
+              exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Export materialized features"
+          echo "Exporting all materialized feature data..."
+          python3 src/pipeline_scripts/create_all_weeks_features.py
+          echo "::endgroup::"
+
+          echo "::group::Validate materialized-feature export"
+          if [[ ! -f "$ENGINEERED_DATA_PATH" ]]; then
+            echo "::error title=Missing feature export::$ENGINEERED_DATA_PATH was not created"
+            exit 1
+          fi
+
+          if [[ ! -s "$ENGINEERED_DATA_PATH" ]]; then
+            echo "::error title=Empty feature export::$ENGINEERED_DATA_PATH is empty"
+            exit 1
+          fi
+
+          EXPORT_DETAILS="$(
+            python3 - "$ENGINEERED_DATA_PATH" <<'PYTHON'
+          import json
+          import sys
+
+          import pandas as pd
+
+          output_path = sys.argv[1]
+          dataframe = pd.read_csv(output_path)
+
+          if dataframe.empty:
+              raise RuntimeError(
+                  "The materialized-feature export contains no rows."
+              )
+
+          required_columns = {"Store", "Date"}
+          missing_columns = sorted(
+              required_columns.difference(dataframe.columns)
+          )
+
+          if missing_columns:
+              raise RuntimeError(
+                  "The materialized-feature export is missing columns: "
+                  + ", ".join(missing_columns)
+              )
+
+          dataframe["Date"] = pd.to_datetime(
+              dataframe["Date"],
+              format="%d-%m-%Y",
+              errors="raise",
+          )
+
+          details = {
+              "rows": int(len(dataframe)),
+              "stores": int(dataframe["Store"].nunique()),
+              "minimum_date": dataframe["Date"].min().strftime("%d-%m-%Y"),
+              "maximum_date": dataframe["Date"].max().strftime("%d-%m-%Y"),
+          }
+
+          print(json.dumps(details))
+          PYTHON
+          )"
+
+          echo "$EXPORT_DETAILS" | jq .
+
+          {
+            echo "row_count=$(jq -r '.rows' <<< "$EXPORT_DETAILS")"
+            echo "store_count=$(jq -r '.stores' <<< "$EXPORT_DETAILS")"
+            echo "minimum_date=$(jq -r '.minimum_date' <<< "$EXPORT_DETAILS")"
+            echo "maximum_date=$(jq -r '.maximum_date' <<< "$EXPORT_DETAILS")"
+          } >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Register materialized-feature data asset
+        id: register-engineered-data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$ENGINEERED_DATA_PATH" ]]; then
+            echo "::error title=Missing engineered data::$ENGINEERED_DATA_PATH does not exist or is empty"
+            exit 1
+          fi
+
+          az ml data create \
+            --name "$ENGINEERED_DATA_ASSET_NAME" \
+            --version "$ENGINEERED_DATA_VERSION" \
+            --type uri_file \
+            --path "$ENGINEERED_DATA_PATH" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME"
+
+          ENGINEERED_DATA_ASSET_URI="azureml:${ENGINEERED_DATA_ASSET_NAME}:${ENGINEERED_DATA_VERSION}"
+
+          {
+            echo "asset_uri=$ENGINEERED_DATA_ASSET_URI"
+            echo "asset_version=$ENGINEERED_DATA_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+          echo ">>> Registered: $ENGINEERED_DATA_ASSET_URI"
+          echo "::notice title=Materialized feature data::$ENGINEERED_DATA_ASSET_URI"
+
+      - name: Create and register batch test data
+        shell: bash
+        id: register-test-data
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Create batch test data"
+          if [[ -z "${LATEST_PROCESSED_DATE:-}" ]]; then
+            echo "::error::LATEST_PROCESSED_DATE is not set."
+            exit 1
+          fi
+
+          TEST_DATE="$LATEST_PROCESSED_DATE"
+
+          TEST_DATA_FILE="${RUNNER_TEMP}/test_data.csv"
+
+          {
+            echo "Store,Date"
+
+            for STORE in $(seq 1 45); do
+              echo "${STORE},${TEST_DATE}"
+            done
+          } > "$TEST_DATA_FILE"
+
+          echo "TEST_DATA_FILE=$TEST_DATA_FILE" >> "$GITHUB_ENV"
+
+          echo "Created test data:"
+          cat "$TEST_DATA_FILE"
+          
+          echo "::endgroup::"
+
+          echo "::group::Register batch test-data asset"
+
+          az ml data create \
+            --name "test_data" \
+            --version "$ENGINEERED_DATA_VERSION" \
+            --type uri_file \
+            --path "$TEST_DATA_FILE" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME"
+          
+          TEST_DATA_ASSET_URI="azureml:test_data:${ENGINEERED_DATA_VERSION}"  
+          echo "test_data_uri=$TEST_DATA_ASSET_URI" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Create registration summary
+        if: success()
+        shell: bash
+        env:
+          ASSET_URI: ${{ steps.register-engineered-data.outputs.asset_uri }}
+          ROW_COUNT: ${{ steps.export-features.outputs.row_count }}
+          STORE_COUNT: ${{ steps.export-features.outputs.store_count }}
+          MINIMUM_DATE: ${{ steps.export-features.outputs.minimum_date }}
+          MAXIMUM_DATE: ${{ steps.export-features.outputs.maximum_date }}
+          TEST_DATA_URI: ${{ steps.register-test-data.outputs.test_data_uri }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Engineered data registration"
+            echo
+            echo "### Materialized features"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Asset | \`$ASSET_URI\` |"
+            echo "| Version | \`$ENGINEERED_DATA_VERSION\` |"
+            echo "| Rows | \`$ROW_COUNT\` |"
+            echo "| Stores | \`$STORE_COUNT\` |"
+            echo "| Date range | \`$MINIMUM_DATE → $MAXIMUM_DATE\` |"
+            echo
+            echo "### Batch test data"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Asset | \`$TEST_DATA_URI\` |"
+            echo "| Version | \`$ENGINEERED_DATA_VERSION\` |"
+            echo "| Test date | \`$LATEST_PROCESSED_DATE\` |"
+            echo "| Stores | \`45\` |"
+            echo
+            echo "Engineered features and batch test data registered successfully."
+          } >> "$GITHUB_STEP_SUMMARY"
+  # ===================================================================
+  # Referesh the realtime endpoint so it is using the latest data
+  # ===================================================================         
+  refresh-realtime-endpoint:
+    name: Refersh realtime endpoint to update csv
+    needs: [register-engineered-data, determine-shared-version, retrieve-required-dates]
+    runs-on: ubuntu-latest
+    env:
+      ENGINEERED_DATA_VERSION: ${{ needs.determine-shared-version.outputs.shared_version }}
+      RT_DEPLOYMENT_YAML: azureml/rt-endpoint-deployment.yaml
+      LATEST_PROCESSED_DATE: ${{ needs.retrieve-required-dates.outputs.latestdate }}
+      FEATURE_DATA_ASSET_VERSION: ${{ needs.register-engineered-data.outputs.asset_version }}
+    outputs:
+      rt_endpoint_name: ${{ steps.query-rt-endpoint-name.outputs.rt_endpoint_name }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+      - name: Query realtime endpoint name
+        id: query-rt-endpoint-name
+        run: |
+          set -euo pipefail
+
+          echo "::group::Discover realtime endpoint"
+          echo "Workspace:       $WORKSPACE_NAME"
+          echo "Resource group:  $RG"
+          echo "Endpoint prefix: $RT_ENDPOINT_PREFIX"
+
+          RT_ENDPOINT_NAME="$(
+              az ml online-endpoint list \
+                  --resource-group "$RG" \
+                  --workspace-name "$WORKSPACE_NAME" \
+                  --query "[?starts_with(name, '${RT_ENDPOINT_PREFIX}')].name | [0]" \
+                  --output tsv
+          )"
+
+          if [[ -n "$RT_ENDPOINT_NAME" ]]; then
+              echo "Existing realtime endpoint found: '$RT_ENDPOINT_NAME'"
+              echo "rt_endpoint_name=$RT_ENDPOINT_NAME" >> "$GITHUB_OUTPUT"
+              echo "RT_ENDPOINT_NAME=$RT_ENDPOINT_NAME" >> "$GITHUB_ENV"
+          else
+              echo "No realtime endpoint beginning with '$RT_ENDPOINT_PREFIX' exists."
+              exit 1
+          fi
+      - name: Get current deployment name
+        run: |
+          set -euo pipefail
+          ENDPOINT_JSON="$(
+            az ml online-endpoint show \
+              --name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json
+          )"
+
+          CURRENT_DEPLOYMENT_NAME="$(
+            jq -r '
+              .traffic
+              | to_entries
+              | map(select(.value > 0))
+              | max_by(.value)
+              | .key
+            ' <<< "$ENDPOINT_JSON"
+          )"
+
+          if [[ -z "$CURRENT_DEPLOYMENT_NAME" ]] \
+            || [[ "$CURRENT_DEPLOYMENT_NAME" == "null" ]]; then
+              echo "ERROR: No deployment currently receives endpoint traffic." >&2
+              exit 1
+          fi
+
+          echo "Current deployment: $CURRENT_DEPLOYMENT_NAME"
+          echo "rt_deployment_name=$CURRENT_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+          echo "RT_DEPLOYMENT_NAME=$CURRENT_DEPLOYMENT_NAME" >> "$GITHUB_ENV"
+        
+      - name: Get currently deployed model version
+        run: |
+          set -euo pipefail
+          MODEL_REFERENCE="$(
+            az ml online-deployment show \
+              --name "$RT_DEPLOYMENT_NAME" \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query model \
+              --output tsv
+          )"
+
+          if [[ -z "$MODEL_REFERENCE" || "$MODEL_REFERENCE" == "null" ]]; then
+            echo "::error title=Missing deployed model::Could not determine the model currently deployed to '$RT_DEPLOYMENT_NAME'."
+            exit 1
+          fi
+          
+          MODEL_VERSION="${MODEL_REFERENCE##*/}"
+
+          if [[ -z "$MODEL_VERSION" ]] \
+            || [[ "$MODEL_VERSION" == "null" ]]; then
+              echo "ERROR: Could not determine the model version currently deployed to the endpoint." >&2
+              exit 1
+          fi
+
+          echo "Currently deployed model version: $MODEL_VERSION"
+          echo "MODEL_VERSION=$MODEL_VERSION" >> "$GITHUB_ENV"
+
+      - name: Create deployment
+        id: create-rt-endpoint-deployment
+        run: |
+          set -euo pipefail
+
+          echo "::group::Prepare realtime deployment"
+          timestamp=$(date -u +'%Y%m%d-%H%M%S')
+          RT_DEPLOYMENT_NAME="rt-deployment-$timestamp"
+          echo "rt_deployment_name=$RT_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+          echo "RT_DEPLOYMENT_NAME=$RT_DEPLOYMENT_NAME" >> "$GITHUB_ENV"
+
+
+          #INSTANCE_TYPE="Standard_DS3_v2"
+          #INSTANCE_TYPE="Standard_DS2_v2"
+          INSTANCE_TYPE="Standard_F4s_v2"
+
+
+          SUBSCRIPTION_ID="$(
+            az account show \
+              --query id \
+              --output tsv
+          )"
+
+           if [[ -z "$SUBSCRIPTION_ID" ]]; then
+            echo "::error::Could not determine the Azure subscription ID."
+            exit 1
+          fi
+
+          # Verify that this exact asset version exists before creating
+          # the deployment.
+          echo "Verifying feature-data asset exists..."
+          az ml data show \
+            --name "$FEATURE_DATA_ASSET_NAME" \
+            --version "$FEATURE_DATA_ASSET_VERSION" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --output none
+
+          echo "Real-time deployment: $RT_DEPLOYMENT_NAME"
+          echo "Instance type: $INSTANCE_TYPE"
+          echo "Model: ${MODEL_NAME}:${MODEL_VERSION}"
+          echo "Feature data: ${FEATURE_DATA_ASSET_NAME}:${FEATURE_DATA_ASSET_VERSION}"
+          
+          echo "RT_DEPLOYMENT_NAME=$RT_DEPLOYMENT_NAME" >> $GITHUB_ENV
+          echo "rt_deployment_name=$RT_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+
+          CURRENT_DEPLOYMENT_TYPES=$(az ml online-deployment list --endpoint-name "$RT_ENDPOINT_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --query "[].instance_type" -o tsv)
+
+          
+          SCORE_SCRIPT="walmart_realtime_score.py"
+
+          export SUBSCRIPTION_ID FEATURE_DATA_ASSET_NAME FEATURE_DATA_ASSET_VERSION RT_DEPLOYMENT_NAME INSTANCE_TYPE SCORE_SCRIPT
+          envsubst \
+            '${INSTANCE_TYPE}
+            ${RT_DEPLOYMENT_NAME}
+            ${RT_ENDPOINT_NAME}
+            ${MODEL_NAME}
+            ${MODEL_VERSION}
+            ${ENDPOINT_ENVIRONMENT}
+            ${SUBSCRIPTION_ID}
+            ${RG}
+            ${WORKSPACE_NAME}
+            ${FEATURE_DATA_ASSET_NAME}
+            ${FEATURE_DATA_ASSET_VERSION}
+            ${SCORE_SCRIPT}' \
+            < azureml/rt-deployment-template.yaml \
+            > "$RT_DEPLOYMENT_YAML"
+
+          if [[ ! -s "$RT_DEPLOYMENT_YAML" ]]; then
+            echo "::error::Deployment YAML was not generated."
+            exit 1
+          fi
+
+          echo "Generated deployment YAML:"
+          cat "$RT_DEPLOYMENT_YAML"
+          echo "::endgroup::"
+          
+          echo "::group::Create realtime deployment"
+          echo "Creating '$RT_DEPLOYMENT_NAME' on endpoint '$RT_ENDPOINT_NAME'..."
+
+          if ! az ml online-deployment create \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --file "$RT_DEPLOYMENT_YAML" \
+            --only-show-errors; then
+
+              echo "::error:'$RT_DEPLOYMENT_NAME' creation failed."
+              az ml online-deployment get-logs \
+                --name "$RT_DEPLOYMENT_NAME" \
+                --endpoint-name "$RT_ENDPOINT_NAME" \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --lines 200 || true
+
+              echo "::endgroup::"
+              exit 1
+          fi
+
+          RT_DEPLOYMENT_STATE=$(az ml online-deployment show --name "$RT_DEPLOYMENT_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --endpoint-name "$RT_ENDPOINT_NAME" --query "provisioning_state" -o tsv)
+           echo "Provisioning state: $RT_DEPLOYMENT_STATE"
+          
+          if [[ "$RT_DEPLOYMENT_STATE" == "Succeeded" ]]; then
+              echo "Deployment '$RT_DEPLOYMENT_NAME' created successfully in endpoint '$RT_ENDPOINT_NAME'"
+          else
+              echo "Failed to create deployment '$RT_DEPLOYMENT_NAME' (provisioningState: $RT_DEPLOYMENT_STATE)"
+              az ml online-deployment get-logs \
+                --name "$RT_DEPLOYMENT_NAME" \
+                --endpoint-name "$RT_ENDPOINT_NAME" \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --lines 200 || true
+              exit 1
+          fi
+          echo "::endgroup::"     
+      - name: Test real-time endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUEST_FILE="${RUNNER_TEMP}/walmart-endpoint-request.json"
+          RESPONSE_FILE="${RUNNER_TEMP}/walmart-endpoint-response.json"
+          RAW_RESPONSE_FILE="${RUNNER_TEMP}/walmart-endpoint-raw-response.json"
+
+          echo "::group:: Create test data"
+          if [[ -z "${LATEST_PROCESSED_DATE:-}" ]]; then
+              echo "::error::LATEST_PROCESSED_DATE is not set"
+              exit 1
+          fi
+
+          REQUEST_DATE="$LATEST_PROCESSED_DATE"
+
+          jq -n \
+              --arg date "$REQUEST_DATE" \
+              '{
+                  input_data: [
+                      {
+                          Store: 1,
+                          Date: $date
+                      }
+                  ]
+              }' > "$REQUEST_FILE"
+
+          echo "Request:"
+          jq . "$REQUEST_FILE"
+          echo "::endgroup::" 
+          
+          echo "::group:: Invoke endpoint"
+          echo "Calling deployment: $RT_DEPLOYMENT_NAME"
+
+          if ! az ml online-endpoint invoke \
+            --name "$RT_ENDPOINT_NAME" \
+            --deployment-name "$RT_DEPLOYMENT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --request-file "$REQUEST_FILE" \
+            --output json > "$RAW_RESPONSE_FILE"; then
+
+            echo "::error title=Endpoint invocation failed::Azure CLI could not invoke the deployment."
+
+            az ml online-deployment get-logs \
+              --name "$RT_DEPLOYMENT_NAME" \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --lines 200 || true
+
+            exit 1
+          fi
+          echo "::endgroup::" 
+
+          echo "::group:: Validate response"
+          if [[ ! -s "$RAW_RESPONSE_FILE" ]]; then
+            echo "::error title=Empty endpoint response::The endpoint returned no content."
+            exit 1
+          fi
+
+          jq -r 'fromjson' "$RAW_RESPONSE_FILE" > "$RESPONSE_FILE"
+
+          echo "Endpoint response:"
+          jq . "$RESPONSE_FILE"
+
+          # 1. Check for API/Model errors
+          if jq -e 'has("error")' "$RESPONSE_FILE" >/dev/null; then
+            ERROR_TYPE="$(jq -r '.error' "$RESPONSE_FILE")"
+            ERROR_MESSAGE="$(jq -r '.message // "No error message returned"' "$RESPONSE_FILE")"
+
+            echo "::error title=Endpoint scoring failed::$ERROR_TYPE: $ERROR_MESSAGE"
+            exit 1
+          fi
+
+
+          # 2. Validate response structure and field presence
+          jq -e \
+            --arg request_date "$REQUEST_DATE" \
+            '
+              (.predictions | type == "array") and
+              (.predictions | length > 0) and
+              (.predictions[0].Store == 1) and
+              (.predictions[0].Feature_Date == $request_date) and
+              (.predictions[0] | has("Prediction_Date")) and
+              (.predictions[0] | has("Predicted_Weekly_Sales")) and
+              (.predictions[0].Predicted_Weekly_Sales != null)
+            ' "$RESPONSE_FILE" >/dev/null || {
+              echo "::error title=Invalid endpoint response::The response structure did not match the expected format."
+              exit 1
+            }
+
+
+          # 3. Extract variables safely
+          STORE="$(jq -r '.predictions[0].Store' "$RESPONSE_FILE")"
+          FEATURE_DATE="$(jq -r '.predictions[0].Feature_Date' "$RESPONSE_FILE")"
+          PREDICTION_DATE="$(jq -r '.predictions[0].Prediction_Date' "$RESPONSE_FILE")"
+          PREDICTED_SALES="$(jq -r '.predictions[0].Predicted_Weekly_Sales' "$RESPONSE_FILE")"
+          echo "::endgroup::" 
+
+          echo "Endpoint test succeeded."
+          echo "Prediction:"
+          echo "Store: $STORE"
+          echo "Feature date: $FEATURE_DATE"
+          echo "Prediction date: $PREDICTION_DATE"
+          echo "Predicted weekly sales: $PREDICTED_SALES"
+      
+      - name: Current traffic allocation
+        run: |
+         set -euo pipefail 
+         CURRENT_TRAFFIC_JSON="$(
+            az ml online-endpoint show \
+              --name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query traffic \
+              --output json
+          )"
+
+          if [[ "$(jq 'length' <<< "$CURRENT_TRAFFIC_JSON")" -eq 0 ]]; then
+            echo "No deployment currently receives endpoint traffic."
+          else
+            jq -r '
+              ["DEPLOYMENT", "TRAFFIC"],
+              (
+                to_entries[]
+                | [.key, "\(.value)%"]
+              )
+              | @tsv
+            ' <<< "$CURRENT_TRAFFIC_JSON" |
+              column -t -s $'\t'
+          fi
+
+          PREVIOUS_TRAFFIC="$(
+            jq --compact-output '.' <<< "$CURRENT_TRAFFIC_JSON"
+          )"
+          echo "PREVIOUS_TRAFFIC=$PREVIOUS_TRAFFIC" >> $GITHUB_ENV
+
+      - name: Update traffic
+        run: |
+          set -euo pipefail
+          echo "Endpoint:       $RT_ENDPOINT_NAME"
+          echo "New deployment: $RT_DEPLOYMENT_NAME"
+          echo "Target traffic: 100%"
+          echo "Resource group: $RG"
+          echo "Workspace:      $WORKSPACE_NAME"
+
+
+          RT_TRAFFIC_JSON=$(az ml online-endpoint update -n "$RT_ENDPOINT_NAME" --traffic "$RT_DEPLOYMENT_NAME=100" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME")
+          RT_TRAFFIC_STATE=$(echo "$RT_TRAFFIC_JSON" | jq -r '.provisioning_state')
+
+          if [[ "$RT_TRAFFIC_STATE" == "Succeeded" ]]; then
+              echo "Traffic for deployment '$RT_DEPLOYMENT_NAME' updated successfully in resource group '$RG'"
+          else
+              echo "Failed to update deployment '$RT_DEPLOYMENT_NAME' traffic (provisioningState: $RT_TRAFFIC_STATE)"
+              exit 1
+          fi
+      - name: Create realtime deployment summary
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Realtime endpoint refresh"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`$RT_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$RT_DEPLOYMENT_NAME\` |"
+            echo "| Model | \`${MODEL_NAME}:${MODEL_VERSION}\` |"
+            echo "| Feature data | \`${FEATURE_DATA_ASSET_NAME}:${FEATURE_DATA_ASSET_VERSION}\` |"
+            echo "| Test date | \`$LATEST_PROCESSED_DATE\` |"
+            echo "| Traffic | \`100%\` |"
+            echo
+            echo "New realtime deployment created, tested, and promoted to 100% traffic."
+          } >> "$GITHUB_STEP_SUMMARY"
+  # ===================================================================
+  # Referesh the batch endpoint so it is using the latest data
+  # ===================================================================  
+  refresh-batch-endpoint-deployment:
+    name: Create batch endpoint deployment for the new model
+    needs: [register-engineered-data, retrieve-required-dates, determine-shared-version]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    env:
+      BATCH_DEPLOYMENT_YAML: azureml/batch-endpoint-deployment.yaml
+      BATCH_DEPLOYMENT_PREFIX: "batch-deployment-"
+      LATEST_PROCESSED_DATE: ${{ needs.retrieve-required-dates.outputs.latestdate }}
+      ENGINEERED_DATA_VERSION: ${{ needs.determine-shared-version.outputs.shared_version }}
+      FEATURE_DATA_ASSET_VERSION: ${{ needs.register-engineered-data.outputs.asset_version }}
+    outputs:
+      batch_endpoint_name: ${{ steps.get-batch-endpoint.outputs.batch_endpoint_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Verify Azure login
+        run: az account show
+      
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install pandas
+      
+      - name: Query batch endpoint name
+        id: get-batch-endpoint
+        run: |
+            set -euo pipefail
+            BATCH_ENDPOINT_NAME="$(
+              az ml batch-endpoint list \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --query "[?starts_with(name, '${BATCH_ENDPOINT_PREFIX}')].name | [0]" \
+                --output tsv
+            )"
+
+            if [[ -z "$BATCH_ENDPOINT_NAME" || "$BATCH_ENDPOINT_NAME" == "null" ]]; then
+              echo "::error title=Batch endpoint not found::No batch endpoint beginning with '$BATCH_ENDPOINT_PREFIX' was found."
+              exit 1
+            fi
+
+            echo "Batch endpoint found: $BATCH_ENDPOINT_NAME"
+            echo "batch_endpoint_name=$BATCH_ENDPOINT_NAME" >> "$GITHUB_OUTPUT"
+            echo "BATCH_ENDPOINT_NAME=$BATCH_ENDPOINT_NAME" >> "$GITHUB_ENV"
+      
+      - name: Get batch endpoint deployment name
+        id: get-batch-deployment
+        run: |
+            set -euo pipefail
+            BATCH_DEPLOYMENT_NAME="$(
+              az ml batch-endpoint show \
+                --name "$BATCH_ENDPOINT_NAME" \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --query "defaults.deployment_name" \
+                --output tsv
+            )"
+
+            if [[ -z "$BATCH_DEPLOYMENT_NAME" || "$BATCH_DEPLOYMENT_NAME" == "null" ]]; then
+              echo "::error title=Missing batch deployment::Endpoint '$BATCH_ENDPOINT_NAME' has no default deployment."
+              exit 1
+            fi
+
+            echo "batch_deployment_name=$BATCH_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+            echo "BATCH_DEPLOYMENT_NAME=$BATCH_DEPLOYMENT_NAME" >> "$GITHUB_ENV"
+     
+      - name: Get currently deployed model version
+        run: |
+          set -euo pipefail
+          MODEL_REFERENCE="$(
+            az ml batch-deployment show \
+              --name "$BATCH_DEPLOYMENT_NAME" \
+              --endpoint-name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query "model" \
+              --output tsv
+          )"
+
+          if [[ -z "$MODEL_REFERENCE" || "$MODEL_REFERENCE" == "null" ]]; then
+            echo "::error title=Missing batch model::Could not determine the model used by batch deployment '$BATCH_DEPLOYMENT_NAME'."
+            exit 1
+          fi
+
+          MODEL_VERSION="${MODEL_REFERENCE##*/}"
+
+          if [[ -z "$MODEL_VERSION" || "$MODEL_VERSION" == "null" ]]; then
+            echo "::error title=Missing model version::Could not extract the model version from '$MODEL_REFERENCE'."
+            exit 1
+          fi
+          
+          echo "MODEL_VERSION=$MODEL_VERSION" >> "$GITHUB_ENV"
+          echo "Batch deployment model version: $MODEL_VERSION"
+
+      - name: Create deployment
+        id: create_batch_deployment
+        run: |
+          set -euo pipefail
+          TIMESTAMP="$(date -u +'%Y%m%d-%H%M%S')"
+          BATCH_DEPLOYMENT_NAME="batch-deployment-$TIMESTAMP"
+          BATCH_DEPLOYMENT_DESC="XGBoost Walmart sales batch deployment"
+          COMPUTE_NAME="${{ vars.TEST_PREFIX }}-compute"
+          SCORE_SCRIPT="walmart_batch_score.py"
+          echo "BATCH_DEPLOYMENT_NAME=$BATCH_DEPLOYMENT_NAME" >> $GITHUB_ENV
+          echo "batch_deployment_name=$BATCH_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+          
+          echo "::group::Resolve and verify Azure resources"
+          SUBSCRIPTION_ID="$(
+              az account show \
+                  --query id \
+                  --output tsv
+          )"
+
+          echo "Subscription ID:      $SUBSCRIPTION_ID"
+          echo "Feature data version: $FEATURE_DATA_ASSET_VERSION"
+          echo "::endgroup::"
+
+          echo "::group::Render batch deployment YAML"
+          export BATCH_DEPLOYMENT_NAME BATCH_DEPLOYMENT_DESC COMPUTE_NAME SCORE_SCRIPT SUBSCRIPTION_ID FEATURE_DATA_ASSET_VERSION          
+          envsubst '${BATCH_DEPLOYMENT_NAME} ${BATCH_DEPLOYMENT_DESC} ${BATCH_ENDPOINT_NAME} ${MODEL_NAME} ${MODEL_VERSION} ${COMPUTE_NAME} ${ENDPOINT_ENVIRONMENT} ${SUBSCRIPTION_ID} ${RG} ${WORKSPACE_NAME} ${FEATURE_DATA_ASSET_NAME} ${FEATURE_DATA_ASSET_VERSION} ${SCORE_SCRIPT}' < azureml/batch-deployment-template.yaml > $BATCH_DEPLOYMENT_YAML
+          
+          if [[ ! -f "$BATCH_DEPLOYMENT_YAML" ]]; then
+            echo "::error title=Missing file::Batch endpoint deployment YAML not found at: $BATCH_DEPLOYMENT_YAML"
+            exit 1
+          fi
+          
+          cat $BATCH_DEPLOYMENT_YAML
+          echo "::endgroup::"
+
+          echo "::group::Create Azure ML batch deployment"
+          # --set-default # causes breakage
+          BATCH_DEPLOYMENT_JSON=$(az ml batch-deployment create --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --file "$BATCH_DEPLOYMENT_YAML")
+          
+          BATCH_DEPLOYMENT_STATE=$(echo "$BATCH_DEPLOYMENT_JSON" | jq -r '.provisioning_state')
+          
+          if [[ "$BATCH_DEPLOYMENT_STATE" == "Succeeded" ]]; then
+              echo "Batch deployment '$BATCH_DEPLOYMENT_NAME' created successfully in resource group '$RG'"
+          else
+              echo "Failed to create batch deployment '$BATCH_DEPLOYMENT_NAME' (provisioningState: $BATCH_DEPLOYMENT_STATE)"
+              exit 1
+          fi
+          echo "::endgroup::"
+      
+      - name: Run batch endpoint job
+        run: |
+          set -euo pipefail
+          echo "::group::Resolve batch input"
+
+          TEST_DATA_VERSION="$ENGINEERED_DATA_VERSION"
+
+          TEST_DATA_ASSET="azureml:test_data:${TEST_DATA_VERSION}"
+
+          echo "Using batch input: $TEST_DATA_ASSET"
+          echo "::endgroup::"
+
+          echo "::group::Invoke batch endpoint"
+          BATCH_JOB=$(
+            az ml batch-endpoint invoke \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --deployment-name "$BATCH_DEPLOYMENT_NAME" \
+              --input "$TEST_DATA_ASSET" \
+              --input-type uri_file \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME"
+          )
+          echo "$BATCH_JOB"
+          BATCH_JOB_NAME=$(echo "$BATCH_JOB" | jq -r '.name')
+          az ml job stream -n "$BATCH_JOB_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME"
+
+          BATCH_JOB_STATUS="$(
+            az ml job show \
+              --name "$BATCH_JOB_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query status \
+              --output tsv
+          )"
+
+          if [[ "$BATCH_JOB_STATUS" != "Completed" ]]; then
+            echo "::error title=Batch job failed::$BATCH_JOB_NAME finished with status '$BATCH_JOB_STATUS'"
+            exit 1
+          fi
+
+          echo "BATCH_JOB_NAME=$BATCH_JOB_NAME" >> $GITHUB_ENV
+          echo "batch_job_name=$BATCH_JOB_NAME" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          {
+            echo "BATCH_JOB_NAME=$BATCH_JOB_NAME"
+            echo "TEST_DATA_VERSION=$TEST_DATA_VERSION"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate batch job output
+        id: validate_batch_output
+        run: |
+            set -euo pipefail
+            echo "::group::Download batch predictions"
+            PREDICTIONS_FILE="batch-results/predictions.csv"
+
+            az ml job download \
+              --name "$BATCH_JOB_NAME" \
+              --output-name score \
+              --download-path batch-results \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME"
+
+            if [[ ! -f "$PREDICTIONS_FILE" ]]; then
+              echo "::error title=Missing predictions::File not found: $PREDICTIONS_FILE"
+              exit 1
+            fi
+
+            echo "File found: $PREDICTIONS_FILE"
+
+            PREDICTION_COUNT=$(( $(wc -l < "$PREDICTIONS_FILE") - 1 ))
+            echo "prediction_count=$PREDICTION_COUNT" >> "$GITHUB_OUTPUT"
+
+            cat $PREDICTIONS_FILE
+            echo "::endgroup::"
+
+            echo "::group::Validate predictions"
+            set +e
+            python src/pipeline_scripts/validate_predictions.py $PREDICTIONS_FILE
+            VALIDATION_EXIT_CODE="$?"
+            set -e
+
+            if [[ "$VALIDATION_EXIT_CODE" -ne 0 ]]; then
+              echo "::error title=Prediction validation failed::$PREDICTIONS_FILE failed validation"
+              exit "$VALIDATION_EXIT_CODE"
+            fi
+            echo "::endgroup::"
+     
+      - name: Set batch deployment as default
+        run: |
+          set -euo pipefail
+          echo "::group::Current default batch deployment"
+          PREVIOUS_DEFAULT="$(
+            az ml batch-endpoint show \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query defaults.deployment_name \
+              --output tsv
+          )"
+
+          echo "Previous default: ${PREVIOUS_DEFAULT:-none}"
+          echo "New default:      $BATCH_DEPLOYMENT_NAME"
+          echo "::endgroup::"
+
+          echo "::group::Update default batch deployment"
+          az ml batch-endpoint update \
+            --name "$BATCH_ENDPOINT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --set "defaults.deployment_name=$BATCH_DEPLOYMENT_NAME" \
+            --output none
+          echo "::endgroup::"
+
+          CURRENT_DEFAULT="$(
+            az ml batch-endpoint show \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query defaults.deployment_name \
+              --output tsv
+          )"
+
+          if [[ "$CURRENT_DEFAULT" != "$BATCH_DEPLOYMENT_NAME" ]]; then
+            echo "::error title=Default deployment update failed::Expected '$BATCH_DEPLOYMENT_NAME', found '${CURRENT_DEFAULT:-none}'"
+            exit 1
+          fi
+
+          {
+            echo "## Batch endpoint deployment"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`$BATCH_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$BATCH_DEPLOYMENT_NAME\` |"
+            echo "| Deployment state | \`Succeeded\` |"
+            echo "| Model | \`${MODEL_NAME}:${MODEL_VERSION}\` |"
+            echo "| Feature data | \`${FEATURE_DATA_ASSET_NAME}:${FEATURE_DATA_ASSET_VERSION}\` |"
+            echo "| Test-data version | \`$TEST_DATA_VERSION\` |"
+            echo "| Batch job | \`$BATCH_JOB_NAME\` |"
+            echo "| Prediction rows | \`${{ steps.validate_batch_output.outputs.prediction_count }}\` |"
+            echo "| Previous default | \`${PREVIOUS_DEFAULT:-none}\` |"
+            echo "| Current default | \`$CURRENT_DEFAULT\` |"
+            echo
+            echo "## Generated reports"
+            echo
+            echo "| Report | Artifact |"
+            echo "|---|---|"
+            echo "| Batch predictions | \`batch-predictions-${{ github.run_id }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload batch predictions
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-predictions-${{ github.run_id }}
+          path: batch-results/
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  # ===================================================================
+  # Delete old deployments that are no longer receiving traffic.
+  # ===================================================================  
+  delete-orphan-deployments:
+    name: Delete old deployments
+    runs-on: ubuntu-latest
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    needs: [refresh-realtime-endpoint, refresh-batch-endpoint-deployment]
+    env:
+      BATCH_ENDPOINT_NAME: ${{ needs.refresh-batch-endpoint-deployment.outputs.batch_endpoint_name }}
+      RT_ENDPOINT_NAME: ${{ needs.refresh-realtime-endpoint.outputs.rt_endpoint_name }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+  
+      - name: Ensure Azure ML CLI v2 extension
+        run: |
+          set -euo pipefail
+          az extension add -n ml -y || az extension update -n ml
+  
+      - name: Delete real-time deployments with no traffic
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Query real-time endpoint"
+          
+
+          TRAFFIC_JSON="$(
+            az ml online-endpoint show \
+              --name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query traffic \
+              --output json
+          )"
+
+          DEPLOYMENTS_JSON="$(
+            az ml online-deployment list \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].{
+                name:name,
+                state:provisioning_state,
+                instanceType:instance_type
+              }' \
+              --output json
+          )"
+
+          DEPLOYMENT_COUNT="$(jq 'length' <<< "$DEPLOYMENTS_JSON")"
+          TRAFFIC_TOTAL="$(jq '[.[]] | add // 0' <<< "$TRAFFIC_JSON")"
+
+          echo "Endpoint:         $RT_ENDPOINT_NAME"
+          echo "Resource group:   $RG"
+          echo "Workspace:        $WORKSPACE_NAME"
+          echo "Deployment count: $DEPLOYMENT_COUNT"
+          echo "Traffic total:    ${TRAFFIC_TOTAL}%"
+          echo
+          echo "Current deployments:"
+
+          if [[ "$DEPLOYMENT_COUNT" -eq 0 ]]; then
+            echo "No real-time deployments exist."
+          else
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                ["DEPLOYMENT", "STATE", "INSTANCE TYPE", "TRAFFIC"],
+                (
+                  $deployments[]
+                  | [
+                      .name,
+                      .state,
+                      .instanceType,
+                      "\($traffic[.name] // 0)%"
+                    ]
+                )
+                | @tsv
+              ' |
+              column -t -s $'\t'
+          fi
+
+          echo "::endgroup::"
+
+          
+          # Explicitly declare the variables as arrays. This prevents
+          # unbound-variable errors when no deployments match.
+          NO_TRAFFIC_DEPLOYMENTS=()
+          DELETED_DEPLOYMENTS=()
+          SKIPPED_DEPLOYMENTS=()
+
+          mapfile -t NO_TRAFFIC_DEPLOYMENTS < <(
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                $deployments[]
+                | select(($traffic[.name] // 0) == 0)
+                | select(
+                    .state == "Succeeded" or
+                    .state == "Failed"
+                  )
+                | .name
+              '
+          )
+
+          mapfile -t SKIPPED_DEPLOYMENTS < <(
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                $deployments[]
+                | select(($traffic[.name] // 0) == 0)
+                | select(
+                    .state != "Succeeded" and
+                    .state != "Failed"
+                  )
+                | "\(.name) (\(.state))"
+              '
+          )
+
+          NO_TRAFFIC_COUNT="${#NO_TRAFFIC_DEPLOYMENTS[@]}"
+          SKIPPED_COUNT="${#SKIPPED_DEPLOYMENTS[@]}"
+
+          echo "::group::Real-time deployment cleanup plan"
+          echo "Eligible for deletion: $NO_TRAFFIC_COUNT"
+          echo "Skipped:               $SKIPPED_COUNT"
+
+          if [[ "$NO_TRAFFIC_COUNT" -eq 0 ]]; then
+            echo "No zero-traffic deployments are eligible for deletion."
+          else
+            echo
+            echo "Deployments to delete:"
+            printf '%s\n' "${NO_TRAFFIC_DEPLOYMENTS[@]}"
+          fi
+
+          if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+            echo
+            echo "Deployments skipped because of their state:"
+            printf '%s\n' "${SKIPPED_DEPLOYMENTS[@]}"
+          fi
+
+          echo "::endgroup::"
+
+          for DEPLOYMENT_NAME in "${NO_TRAFFIC_DEPLOYMENTS[@]}"; do
+            echo "::group::Delete deployment $DEPLOYMENT_NAME"
+
+            az ml online-deployment delete \
+              --name "$DEPLOYMENT_NAME" \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --yes
+
+            DELETED_DEPLOYMENTS+=("$DEPLOYMENT_NAME")
+
+            echo "Deleted deployment: $DEPLOYMENT_NAME"
+            echo "::endgroup::"
+          done
+
+          DELETED_COUNT="${#DELETED_DEPLOYMENTS[@]}"
+
+          REMAINING_DEPLOYMENTS_JSON="$(
+            az ml online-deployment list \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].name' \
+              --output json
+          )"
+
+          REMAINING_COUNT="$(
+            jq 'length' <<< "$REMAINING_DEPLOYMENTS_JSON"
+          )"
+
+          echo "::group::Real-time deployment cleanup result"
+          echo "Deleted deployments:   $DELETED_COUNT"
+          echo "Skipped deployments:   $SKIPPED_COUNT"
+          echo "Remaining deployments: $REMAINING_COUNT"
+
+          if [[ "$REMAINING_COUNT" -gt 0 ]]; then
+            echo
+            echo "Remaining deployments:"
+            jq -r '.[]' <<< "$REMAINING_DEPLOYMENTS_JSON"
+          fi
+
+          echo "::endgroup::"
+
+          {
+            echo "## Real-time deployment cleanup"
+            echo
+            echo "| Result | Count |"
+            echo "|---|---:|"
+            echo "| Deleted | \`$DELETED_COUNT\` |"
+            echo "| Skipped | \`$SKIPPED_COUNT\` |"
+            echo "| Remaining | \`$REMAINING_COUNT\` |"
+            echo
+            echo "### Deleted deployments"
+            echo
+
+            if [[ "$DELETED_COUNT" -eq 0 ]]; then
+              echo "No real-time deployments were deleted."
+            else
+              for DEPLOYMENT_NAME in "${DELETED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT_NAME\`"
+              done
+            fi
+
+            if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+              echo
+              echo "### Skipped deployments"
+              echo
+
+              for DEPLOYMENT in "${SKIPPED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: Delete non-default deployments
+        run: | 
+          set -euo pipefail
+          DEFAULT_DEPLOYMENT=$(az ml batch-endpoint show -g "$RG" -w "$WORKSPACE_NAME" -n "$BATCH_ENDPOINT_NAME" --query "defaults.deployment_name" -o tsv)
+
+          if [[ -z "$DEFAULT_DEPLOYMENT" ||
+            "$DEFAULT_DEPLOYMENT" == "null" ]]; then
+            echo "::error title=Missing default batch deployment::Cleanup stopped to avoid deleting every batch deployment"
+            exit 1
+          fi
+          
+          echo "$DEFAULT_DEPLOYMENT"
+
+          BATCH_DEPLOYMENTS_JSON="$(
+            az ml batch-deployment list \
+              --endpoint-name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].{
+                name:name,
+                state:provisioning_state
+              }' \
+              --output json
+          )"
+          BATCH_DEPLOYMENT_COUNT="$(
+            jq 'length' <<< "$BATCH_DEPLOYMENTS_JSON"
+          )"
+
+          DEPLOYMENTS_TO_DEL=$(az ml batch-deployment list -g "$RG" -w "$WORKSPACE_NAME" -e "$BATCH_ENDPOINT_NAME" --query "[?name!='$DEFAULT_DEPLOYMENT'].[name, provisioning_state]" -o tsv)
+
+          echo "Endpoint:         $BATCH_ENDPOINT_NAME"
+          echo "Default:          $DEFAULT_DEPLOYMENT"
+          echo "Deployment count: $BATCH_DEPLOYMENT_COUNT"
+          echo
+          echo "Current deployments: $BATCH_DEPLOYMENTS_JSON"
+          echo "Delployments to delete: $DEPLOYMENTS_TO_DEL" 
+          
+          if [[ -z "$DEPLOYMENTS_TO_DEL" ]]; then
+            echo "No non-default deployments found."
+            exit 0
+          fi
+
+          DELETED_COUNT=0
+          DELETED_DEPLOYMENTS=()
+            
+          # Read name and state for each line
+          while read -r DEPLOYMENT_NAME STATE; do
+            echo "Checking $DEPLOYMENT_NAME (state: $STATE)"
+
+            # Optionally skip if still provisioning
+            if [[ "$STATE" != "Succeeded" && "$STATE" != "Failed" ]]; then
+              echo "Skipping $DEPLOYMENT_NAME (state not deletable)."
+              continue
+            fi
+          
+            echo "Deleting deployment: $DEPLOYMENT_NAME"
+            az ml batch-deployment delete \
+              -g "$RG" -w "$WORKSPACE_NAME" -e "$BATCH_ENDPOINT_NAME" \
+              -n "$DEPLOYMENT_NAME" --yes
+          
+            DELETED_DEPLOYMENTS+=("$DEPLOYMENT_NAME")
+            ((DELETED_COUNT+=1))
+
+          done <<< "$DEPLOYMENTS_TO_DEL"
+          
+          REMAINING_DEPLOYMENTS_JSON="$(
+            az ml batch-deployment list \
+              --endpoint-name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].name' \
+              --output json
+          )"
+          REMAINING_COUNT="$(jq 'length' <<< "$REMAINING_DEPLOYMENTS_JSON")"
+
+
+          echo "Finished cleaning up non-default batch deployments." 
+
+          {
+            echo "## Batch deployment cleanup"
+            echo
+            echo "| Result | Count |"
+            echo "|---|---:|"
+            echo "| Deleted | \`$DELETED_COUNT\` |"
+            echo "| Remaining | \`$REMAINING_COUNT\` |"
+            echo
+            echo "### Default deployment"
+            echo
+            echo "- \`$DEFAULT_DEPLOYMENT\`"
+            echo
+            echo "### Deleted deployments"
+            echo
+            if [[ "$DELETED_COUNT" -eq 0 ]]; then
+              echo "No batch deployments were deleted."
+            else
+              for DEPLOYMENT_NAME in "${DELETED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT_NAME\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+  # ===================================================================
+  # Write the final pipeline summary.
+  # ===================================================================
+  pipeline-summary:
+    name: Walmart pipeline summary
+    needs: [determine-shared-version, update-datalake, materialize-features, register-engineered-data, refresh-realtime-endpoint, refresh-batch-endpoint-deployment]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write pipeline summary
+        shell: bash
+        env:
+          ADLS_VERSION: ${{ needs.determine-shared-version.outputs.shared_version }}
+          ADLS_FILE_VERSION_PATH: ${{ needs.determine-shared-version.outputs.adls_file_version_path }}
+          MATERIALIZATION_JOB_COUNT: ${{ needs.materialize-features.outputs.job_count }}
+
+          ENGINEERED_DATA_ASSET_URI: ${{ needs.register-engineered-data.outputs.asset_uri }}
+          ENGINEERED_DATA_ASSET_VERSION: ${{ needs.register-engineered-data.outputs.asset_version }}
+          TEST_DATA_ASSET_URI: ${{ needs.register-engineered-data.outputs.test_data_uri }}
+
+          EXPORTED_ROW_COUNT: ${{ needs.register-engineered-data.outputs.row_count }}
+          EXPORTED_STORE_COUNT: ${{ needs.register-engineered-data.outputs.store_count }}
+          EXPORTED_MINIMUM_DATE: ${{ needs.register-engineered-data.outputs.minimum_date }}
+          EXPORTED_MAXIMUM_DATE: ${{ needs.register-engineered-data.outputs.maximum_date }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Walmart Data Lake pipeline completed"
+            echo
+            echo "### Source data"
+            echo
+            echo "- Storage account: \`$ADLS_ACCOUNT\`"
+            echo "- Filesystem: \`$ADLS_FILESYSTEM\`"
+            echo "- Version: \`$ADLS_VERSION\`"
+            echo "- Versioned path: \`$ADLS_FILE_VERSION_PATH\`"
+            echo "- Current path: \`$ADLS_CURRENT_FILE_PATH\`"
+            echo
+            echo "### Materialization"
+            echo
+            echo "- Feature store: \`$FEATURE_STORE_WS\`"
+            echo "- Feature set: \`${FEATURE_SET_NAME}:${FEATURE_SET_VERSION}\`"
+            echo "- Materialization jobs: \`$MATERIALIZATION_JOB_COUNT\`"
+            echo
+            echo "### Registered engineered data"
+            echo
+            echo "- Asset: \`$ENGINEERED_DATA_ASSET_URI\`"
+            echo "- Version: \`$ENGINEERED_DATA_ASSET_VERSION\`"
+            echo "- Exported file: \`$ENGINEERED_DATA_PATH\`"
+            echo "- Rows: \`$EXPORTED_ROW_COUNT\`"
+            echo "- Stores: \`$EXPORTED_STORE_COUNT\`"
+            echo "- Date range: \`$EXPORTED_MINIMUM_DATE\` to \`$EXPORTED_MAXIMUM_DATE\`"
+            echo
+            echo "Asset: \ `$TEST_DATA_ASSET_URI`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo ">>> Pipeline completed successfully."
+          echo ">>> Registered asset: $ENGINEERED_DATA_ASSET_URI"

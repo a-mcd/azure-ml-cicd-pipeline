@@ -1,0 +1,2538 @@
+####
+# Builds a canidate model, compares it to the champion model and deploys it if it is better
+####
+name:  Walmart Test Pipeline
+
+on:
+  # push:
+  #   branches: ["**"]
+  # pull_request:
+  #   branches: ["**"]
+  workflow_dispatch:
+
+env:
+  STORAGE_TYPE: "${{ vars.TEST_STORAGE_TYPE }}"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONPATH: ${{ github.workspace }}
+  MPLBACKEND: Agg
+  RG: "${{ vars.TEST_PREFIX }}-rg"
+  WORKSPACE_NAME: "${{ vars.TEST_PREFIX }}_workspace"
+
+  FEATURE_STORE_WS: "${{ vars.TEST_PREFIX }}_fs_ws"
+  FEATURE_SET_NAME: walmart_sales_features
+  FEATURE_SET_VERSION: "1"
+  FEATURE_DATA_ASSET_NAME: "walmart_materialized_features"
+
+  TRAINING_ENVIRONMENT: "${{ vars.TEST_PREFIX }}-training-env:${{ vars.TEST_TRAINING_ENV_VERSION }}"
+  ENDPOINT_ENVIRONMENT: "${{ vars.TEST_PREFIX }}-endpoint-env:${{ vars.TEST_ENDPOINT_ENV_VERSION }}"
+
+  RT_ENDPOINT_PREFIX: "rt-walmart-sales-"
+  BATCH_ENDPOINT_PREFIX: "batch-walmart-sales"
+  DATALAKE_ASSET_PATH: "walmart-sales/current/Walmart_Sales.csv"
+  DATALAKE_ASSET_URI: "azureml://datastores/walmart_datalake/paths/walmart-sales/current/Walmart_Sales.csv"
+  BLOBSTORAGE_ASSET_URL: "azureml:walmart_sales_dataset@latest"
+
+  MODEL_NAME: "walmart-xgb"
+
+  PYTHON_VERSION: "3.12"
+  ARTIFACT_RETENTION_DAYS: 30
+
+jobs:
+  pylint:
+    name: Run Pylint Stage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-tests.txt
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Install project dependencies"
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -r requirements.txt \
+            -r requirements-tests.txt
+          echo "::endgroup::"
+
+          echo "::group::Verify lint environment"
+          python --version
+          python -m pip --version
+          pylint --version
+          echo "::endgroup::"
+
+      - name: Run Pylint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p reports
+
+          echo "::group::Run Pylint checks"
+
+          set +e
+          pylint \
+            --fail-under=10.0 \
+            src \
+            2>&1 | tee reports/pylint-report.txt
+
+          PYLINT_EXIT_CODE="${PIPESTATUS[0]}"
+          set -e
+
+          echo "::endgroup::"
+
+          PYLINT_SCORE="$(
+            sed -n \
+              's/.*rated at \([-0-9.]*\)\/10.*/\1/p' \
+              reports/pylint-report.txt |
+            tail -n 1
+          )"
+
+          if [[ -z "$PYLINT_SCORE" ]]; then
+            PYLINT_SCORE="unknown"
+          fi
+
+          {
+            echo "## Pylint"
+            echo
+            echo "- Score: \`${PYLINT_SCORE}/10\`"
+            echo "- Required score: \`10.0/10\`"
+            echo "- Exit code: \`$PYLINT_EXIT_CODE\`"
+
+            echo "## Generated reports"
+            echo
+            echo "| Report | Artifact | Retention |"
+            echo "|---|---|---:|"
+            echo "| Pylint report | \`pylint-report-${{ github.run_id }}\` | 30 days |"
+            echo
+            echo "Report file: \`reports/pylint-report.txt\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$PYLINT_EXIT_CODE" -ne 0 ]]; then
+            echo "::error title=Pylint failed::Score ${PYLINT_SCORE}/10; required 10.0/10"
+          fi
+
+          exit "$PYLINT_EXIT_CODE"
+
+      - name: Upload Pylint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pylint-report-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  code-tests:
+    name: Unit/Integration Tests Stage 
+    runs-on: ubuntu-latest
+    env:
+      TEST_COVERAGE_THRESHOLD: 98
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          echo "::group::Install project dependencies"
+          pip install -r requirements.txt
+          pip install -r requirements-tests.txt
+          echo "::endgroup::"
+
+          echo "::group::Install linting tools"
+          pip install pylint
+          echo "::endgroup::"
+
+      - name: Run unit and integration tests
+        run: |
+          set -euo pipefail
+          
+          mkdir -p reports
+          
+          echo "::group::Run pytest tests"
+          set +e
+
+          LOCUST_SKIP_MONKEY_PATCH=1 \
+          pytest tests \
+            --maxfail=1 \
+            --junitxml=reports/tests.xml \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-fail-under="$TEST_COVERAGE_THRESHOLD" \
+            -q \
+            2>&1 | tee reports/pytest-output.txt
+          
+          PYTEST_EXIT_CODE=$?
+          set -e
+          echo "::endgroup::"
+
+          echo "::group::Test results summary"
+
+          TEST_SUMMARY="$(
+            grep -E \
+              '[0-9]+ (passed|failed|error|errors|skipped|deselected)' \
+              reports/pytest-output.txt |
+            tail -n 1 ||
+            true
+          )"
+
+          if [[ -z "$TEST_SUMMARY" ]]; then
+            TEST_SUMMARY="Pytest did not produce a recognizable test summary"
+          fi
+
+          COVERAGE_LINE="$(
+            grep -E \
+              'TOTAL[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+%' \
+              reports/pytest-output.txt |
+            tail -n 1 ||
+            true
+          )"
+
+          COVERAGE_PERCENT="$(
+            awk '{print $4}' <<< "$COVERAGE_LINE" |
+            tr -d '%' ||
+            true
+          )"
+
+          echo "Pytest exit code: $PYTEST_EXIT_CODE"
+
+          if [[ "$PYTEST_EXIT_CODE" -eq 0 ]]; then
+            TEST_STATUS="Passed"
+          else
+            TEST_STATUS="Failed"
+            echo "::error title=Tests failed::$TEST_SUMMARY; Pytest exit code $PYTEST_EXIT_CODE"
+          fi
+
+          if [[ -z "$COVERAGE_PERCENT" ]]; then
+            COVERAGE_STATUS="Unknown"
+            echo "::warning title=Test coverage unknown::Could not extract coverage percentage from Pytest output"
+          else
+            COVERAGE_STATUS="Passed"
+          fi
+
+          echo "Pytest exit code: $PYTEST_EXIT_CODE"
+          echo "Test result:      $TEST_STATUS"
+          echo "Test summary:     $TEST_SUMMARY"
+          echo "Coverage:         ${COVERAGE_PERCENT:-unknown}%"
+          echo "Coverage result:  $COVERAGE_STATUS"
+          
+          echo "::endgroup::"
+
+          echo "::group::Generated reports"
+          ls -la reports
+          {
+            echo "## Unit and integration tests"
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Tests | $TEST_STATUS |"
+            echo "| Coverage | $COVERAGE_STATUS |"
+            echo
+            echo "### Results"
+            echo
+            echo "- Test summary: \`$TEST_SUMMARY\`"
+            echo "- Coverage: \`${COVERAGE_PERCENT:-unknown}%\`"
+            echo "- Required coverage: \`${TEST_COVERAGE_THRESHOLD}%\`"
+            echo "- Pytest exit code: \`$PYTEST_EXIT_CODE\`"
+            echo
+            echo "### Generated reports"
+            echo
+            echo "- \`tests.xml\`: JUnit test results"
+            echo "- \`coverage.xml\`: XML coverage report"
+            echo "- \`pytest-output.txt\`: Complete Pytest output"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          
+          exit $PYTEST_EXIT_CODE
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: reports/ 
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  get-endpoint-names:
+    name: Retrieve endpoint names
+    runs-on: ubuntu-latest
+    needs: [code-tests, pylint]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    outputs:
+      rt_endpoint_name: ${{ steps.get-rt-endpoint.outputs.rt_endpoint_name }}
+      batch_endpoint_name: ${{ steps.get-batch-endpoint.outputs.batch_endpoint_name }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+      - name: Query realtime endpoint name
+        id: get-rt-endpoint
+        run: |
+            set -euo pipefail
+            echo "::group::Find matching real-time endpoints"
+            MATCHING_ENDPOINTS="$(
+                az ml online-endpoint list \
+                    --resource-group "$RG" \
+                    --workspace-name "$WORKSPACE_NAME" \
+                    --query "[?starts_with(name, '${RT_ENDPOINT_PREFIX}')].name" \
+                    --output json
+            )"
+            MATCH_COUNT="$(jq 'length' <<< "$MATCHING_ENDPOINTS")"
+            RT_ENDPOINT_NAME="$(jq -r 'sort | first // empty' <<< "$MATCHING_ENDPOINTS")"
+            RT_ENDPOINT_NAME="$(
+              jq -r 'sort | first // empty' <<< "$MATCHING_ENDPOINTS"
+            )"
+            echo "::endgroup::"
+
+            if [[ "$MATCH_COUNT" -eq 0 ]]; then
+                echo "::error::No real-time endpoint beginning with '$RT_ENDPOINT_PREFIX' was found."
+                exit 1
+            fi
+
+            if [[ "$MATCH_COUNT" -gt 1 ]]; then
+                echo "::warning title=Multiple real-time endpoints::Selected '$RT_ENDPOINT_NAME' from $MATCH_COUNT matches"
+                echo "Matching endpoints:"
+                jq -r '.[]' <<< "$MATCHING_ENDPOINTS"
+            fi
+
+            echo "rt_endpoint_name=$RT_ENDPOINT_NAME" >> "$GITHUB_OUTPUT"
+      - name: Query batch endpoint name
+        id: get-batch-endpoint
+        run: |
+            set -euo pipefail
+            echo "::group::Find matching batch endpoints"
+            MATCHING_ENDPOINTS="$(
+                az ml batch-endpoint list \
+                    --resource-group "$RG" \
+                    --workspace-name "$WORKSPACE_NAME" \
+                    --query "[?starts_with(name, '${BATCH_ENDPOINT_PREFIX}')].name" \
+                    --output json
+            )"
+
+            MATCH_COUNT="$(jq 'length' <<< "$MATCHING_ENDPOINTS")"
+            BATCH_ENDPOINT_NAME="$(jq -r 'sort | first // empty' <<< "$MATCHING_ENDPOINTS")"
+
+             echo "::endgroup::"
+
+            if [[ "$MATCH_COUNT" -eq 0 ]]; then
+                echo "::error::No batch endpoint beginning with '$BATCH_ENDPOINT_PREFIX' was found."
+                exit 1
+            fi
+            echo "batch_endpoint_name=$BATCH_ENDPOINT_NAME" >> "$GITHUB_OUTPUT"
+
+            if [[ "$MATCH_COUNT" -gt 1 ]]; then
+              echo "::warning title=Multiple real-time endpoints::Selected '$RT_ENDPOINT_NAME' from $MATCH_COUNT matches"
+              echo "Matching endpoints:"
+              jq -r '.[]' <<< "$MATCHING_ENDPOINTS"
+            fi
+
+      - name: Write endpoint summary
+        shell: bash
+        env:
+          RT_ENDPOINT_NAME: ${{ steps.get-rt-endpoint.outputs.rt_endpoint_name }}
+          BATCH_ENDPOINT_NAME: ${{ steps.get-batch-endpoint.outputs.batch_endpoint_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Resolved Azure ML endpoints"
+            echo
+            echo "| Endpoint type | Name |"
+            echo "|---|---|"
+            echo "| Real-time | \`$RT_ENDPOINT_NAME\` |"
+            echo "| Batch | \`$BATCH_ENDPOINT_NAME\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+  retrieve-last-date:
+    name: Get the last materialised date
+    needs: [code-tests, pylint]
+    runs-on: ubuntu-latest
+    outputs:
+      latestdate: ${{ steps.get-last-processed-date.outputs.latest-processed-date }}
+    steps:
+      
+      - uses: actions/checkout@v6
+      
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Install Python dependencies"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade setuptools
+          python3 -m pip install -r requirements.txt
+          echo "::endgroup::"
+
+          echo "::group::Verify runtime environment"
+          python --version
+          python -m pip --version
+          java -version 2>&1
+          echo "JAVA_HOME=$JAVA_HOME"
+
+          python -c \
+            "from distutils.version import LooseVersion; print('distutils compatibility is available')"
+
+          python -m pip check
+          echo "::endgroup::"
+      
+      - name: Discover feature-store storage
+        id: feature-store-storage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Discover feature-store storage"
+
+          SUBSCRIPTION_ID="$(
+            az account show \
+              --query id \
+              --output tsv
+          )"
+
+          if [[ -z "$SUBSCRIPTION_ID" ||
+                "$SUBSCRIPTION_ID" == "null" ]]; then
+            echo "::endgroup::"
+            echo "::error title=Subscription unresolved::Could not determine the current Azure subscription ID"
+            exit 1
+          fi
+
+          FEATURE_STORE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG}/providers/Microsoft.MachineLearningServices/workspaces/${FEATURE_STORE_WS}"
+
+          FEATURE_STORE_STORAGE_ID="$(
+            az resource show \
+              --ids "$FEATURE_STORE_ID" \
+              --query properties.storageAccount \
+              --output tsv
+          )"
+
+          if [[ -z "$FEATURE_STORE_STORAGE_ID" ||
+                "$FEATURE_STORE_STORAGE_ID" == "null" ]]; then
+            echo "::endgroup::"
+            echo "::error title=Feature-store storage unresolved::Could not determine the storage account for feature store '$FEATURE_STORE_WS'"
+            exit 1
+          fi
+
+          OFFLINE_STORE_SCOPE="$(
+            az ml feature-store show \
+              --name "$FEATURE_STORE_WS" \
+              --resource-group "$RG" \
+              --query offline_store.target \
+              --output tsv
+          )"
+
+          if [[ -z "$OFFLINE_STORE_SCOPE" ||
+                "$OFFLINE_STORE_SCOPE" == "null" ]]; then
+            echo "::endgroup::"
+            echo "::error title=Offline store unresolved::Could not determine the offline-store container for feature store '$FEATURE_STORE_WS'"
+            exit 1
+          fi
+
+          OFFLINE_STORAGE_ACCOUNT="${FEATURE_STORE_STORAGE_ID##*/}"
+          OFFLINE_STORAGE_CONTAINER="${OFFLINE_STORE_SCOPE##*/}"
+
+          echo "Storage account: $OFFLINE_STORAGE_ACCOUNT"
+          echo "Container:       $OFFLINE_STORAGE_CONTAINER"
+          echo "::endgroup::"
+
+          {
+            echo "offline-storage-account=$OFFLINE_STORAGE_ACCOUNT"
+            echo "offline-storage-container=$OFFLINE_STORAGE_CONTAINER"
+          } >> "$GITHUB_OUTPUT"
+      
+      - name: Read latest materialized date
+        shell: bash
+        env:
+          OFFLINE_STORAGE_ACCOUNT: ${{ steps.feature-store-storage.outputs.offline-storage-account }}
+          OFFLINE_STORAGE_CONTAINER: ${{ steps.feature-store-storage.outputs.offline-storage-container }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::Authenticate to offline feature store"
+
+          AZURE_STORAGE_KEY="$(
+            az storage account keys list \
+              --resource-group "$RG" \
+              --account-name "$OFFLINE_STORAGE_ACCOUNT" \
+              --query "[0].value" \
+              --output tsv
+          )"
+
+          if [[ -z "$AZURE_STORAGE_KEY" ||
+                "$AZURE_STORAGE_KEY" == "null" ]]; then
+            echo "::endgroup::"
+            echo "::error title=Storage authentication failed::Could not retrieve a key for storage account '$OFFLINE_STORAGE_ACCOUNT'"
+            exit 1
+          fi
+
+          echo "::add-mask::$AZURE_STORAGE_KEY"
+          export AZURE_STORAGE_KEY
+
+          echo "Offline feature-store authentication configured."
+          echo "::endgroup::"
+
+          echo "::group::Read latest materialized date"
+          python src/pipeline_scripts/get_latest_materialised_date.py \
+            --github-env
+          echo "::endgroup::"
+      
+      - name: Validate and publish last processed date
+        id: get-last-processed-date
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${LATEST_PROCESSED_DATE:-}" ]]; then
+            echo "::error title=Materialized date missing::LATEST_PROCESSED_DATE was not produced by the feature-store query"
+            exit 1
+          fi
+
+          if ! python - "$LATEST_PROCESSED_DATE" <<'PYTHON'
+          from datetime import datetime
+          import sys
+
+          datetime.strptime(sys.argv[1], "%d-%m-%Y")
+          PYTHON
+          then
+            echo "::error title=Invalid materialized date::Expected DD-MM-YYYY but received '$LATEST_PROCESSED_DATE'"
+            exit 1
+          fi
+
+          echo "latest-processed-date=$LATEST_PROCESSED_DATE" \
+            >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Feature-store materialization"
+            echo
+            echo "- Feature store: \`$FEATURE_STORE_WS\`"
+            echo "- Feature set: \`${FEATURE_SET_NAME}:${FEATURE_SET_VERSION}\`"
+            echo "- Latest materialized date: \`$LATEST_PROCESSED_DATE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+  train-models:
+    name: Train models and validate
+    runs-on: ubuntu-latest
+    needs: [code-tests, pylint]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    env:
+      JOB_YAML: azureml/job.yaml
+      EXPERIMENT_NAME: "${{ vars.TEST_PREFIX }}_candidate_experiment"
+      R2_MIN: 0.90
+      MAPE_MAX: 10
+      MAE_MAX: 100000
+      RMSE_RATIO_MAX: 2.0
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg:
+          - { iteration: 1, eta: 0.10, max_depth: 8, n_estimators: 900, subsample: 0.8, colsample_bytree: 0.8, reg_alpha: 0.0, reg_lambda: 1.0 }
+          - { iteration: 2, eta: 0.05, max_depth: 10, n_estimators: 1400, subsample: 0.8, colsample_bytree: 0.8, reg_alpha: 0.5, reg_lambda: 3.0 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Verify Azure login
+        run: az account show
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+          
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Install project dependencies"
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          echo "::endgroup::"
+
+          echo "::group::Verify Python environment"
+          python --version
+          python -m pip --version
+          python -m pip check
+          echo "::endgroup::"
+
+      - name: Render Azure ML job YAML from template
+        env:
+          ITER: ${{ matrix.cfg.iteration }}
+          ETA: ${{ matrix.cfg.eta }}
+          MAX_DEPTH: ${{ matrix.cfg.max_depth }}
+          N_ESTIMATORS: ${{ matrix.cfg.n_estimators }}
+          SUBSAMPLE: ${{ matrix.cfg.subsample }}
+          COLSAMPLE_BYTREE: ${{ matrix.cfg.colsample_bytree }}
+          REG_ALPHA: ${{ matrix.cfg.reg_alpha }}
+          REG_LAMBDA: ${{ matrix.cfg.reg_lambda }}
+          SCRIPT_NAME: "xgb_walmart_model_script.py"
+          COMPUTE_NAME: "${{ vars.TEST_PREFIX }}-compute"
+          DESCRIPTION: "Walmart Sales Prediction job ${{ matrix.cfg.iteration }}"
+          CHALLENGER_MODEL: ""
+        run: |
+          set -euo pipefail
+          echo "::group::Candidate $ITER configuration"
+          echo "ITER=$ITER" >> $GITHUB_ENV
+          echo "ETA=$ETA" >> $GITHUB_ENV
+          echo "MAX_DEPTH=$MAX_DEPTH" >> $GITHUB_ENV
+          echo "N_ESTIMATORS=$N_ESTIMATORS" >> $GITHUB_ENV
+          echo "SUBSAMPLE=$SUBSAMPLE" >> $GITHUB_ENV
+          echo "COLSAMPLE_BYTREE=$COLSAMPLE_BYTREE" >> $GITHUB_ENV
+          echo "REG_ALPHA=$REG_ALPHA" >> $GITHUB_ENV
+          echo "REG_LAMBDA=$REG_LAMBDA" >> $GITHUB_ENV
+          echo "CHALLENGER_MODEL=$CHALLENGER_MODEL" >> $GITHUB_ENV
+          echo
+          echo "Validation thresholds:"
+          echo "R2 minimum:         $R2_MIN"
+          echo "MAPE maximum:       $MAPE_MAX"
+          echo "MAE maximum:        $MAE_MAX"
+          echo "RMSE ratio maximum: $RMSE_RATIO_MAX"
+          echo "::endgroup::"
+
+          if [[ "${STORAGE_TYPE:-}" == "datalake" ]]; then
+              export WALMART_SALES_ASSET_URI=$DATALAKE_ASSET_URI
+              TEMPLATE="azureml/job_datalake.template.yaml"
+          elif [[ "${STORAGE_TYPE:-}" == "blobstore" ]]; then
+              export WALMART_SALES_ASSET_URI=$BLOBSTORAGE_ASSET_URL
+              TEMPLATE="azureml/job_blobstore.template.yaml"
+          else
+              echo "::error::STORAGE_TYPE must be either 'datalake' or 'blobstore'. Current value: '${STORAGE_TYPE:-<unset>}'"
+              exit 1
+          fi
+
+          echo "::group::Render candidate job YAML"
+          envsubst '${WALMART_SALES_ASSET_URI} ${EXPERIMENT_NAME} ${DESCRIPTION} ${COMPUTE_NAME} ${SCRIPT_NAME} ${TRAINING_ENVIRONMENT} ${ETA} ${MAX_DEPTH} ${N_ESTIMATORS} ${SUBSAMPLE} ${COLSAMPLE_BYTREE} ${REG_ALPHA} ${REG_LAMBDA} ${CHALLENGER_MODEL}' < "$TEMPLATE" > "$JOB_YAML$ITER"
+          cat $JOB_YAML$ITER
+          echo "::endgroup::"
+
+      - name: Submit Azure ML job
+        id: submit_job
+        run: |
+          set -euo pipefail
+          JOB_STATUS_JSON=$(az ml job create --file "$JOB_YAML$ITER" \
+                              --resource-group "$RG" \
+                              --workspace-name "$WORKSPACE_NAME" \
+                              -o json)
+          JOB_NAME=$(echo "$JOB_STATUS_JSON" | jq -r '.name')
+          JOB_STATUS=$(echo "$JOB_STATUS_JSON" | jq -r '.status')
+          echo "Job $JOB_NAME was created with status $JOB_STATUS"
+          echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Stream job logs
+        env:
+          JOB_NAME: ${{ steps.submit_job.outputs.job_name }}
+        run: |
+          set -euo pipefail
+          az ml job stream --name "$JOB_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME"
+          # If the job failed, 'az ml job stream' will exit non-zero
+          echo "Training job $JOB_NAME completed successfully."
+
+      - name: Get and validate MLFlow metrics
+        env:
+          JOB_NAME: ${{ steps.submit_job.outputs.job_name }}
+          ITER: ${{ matrix.cfg.iteration }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::Validate candidate $ITER metrics"
+          python src/pipeline_scripts/validate_model_metrics.py \
+            --iteration $ITER \
+            --job_name $JOB_NAME \
+            --rg "$RG" \
+            --workspace_name "$WORKSPACE_NAME" \
+            --r2_min "$R2_MIN" \
+            --mape_max "$MAPE_MAX" \
+            --mae_max "$MAE_MAX" \
+            --rmse_ratio_max "$RMSE_RATIO_MAX"
+
+          METRICS_FILE="job_eval_model_${JOB_NAME}.json"
+
+          if [[ ! -s "$METRICS_FILE" ]]; then
+            echo "::endgroup::"
+            echo "::error title=Candidate metrics missing::Expected metrics file was not created: $METRICS_FILE"
+            exit 1
+          fi
+
+          jq . "$METRICS_FILE"
+          echo "::endgroup::"
+
+          VALIDATION_STATUS="$(
+            jq -r '.status | tostring' "$METRICS_FILE"
+          )"
+
+          R2="$(
+            jq -r '.R2 // .r2 // .metrics.R2 // .metrics.r2 // "unknown"' \
+              "$METRICS_FILE"
+          )"
+
+          MAPE="$(
+            jq -r '.MAPE // .mape // .metrics.MAPE // .metrics.mape // "unknown"' \
+              "$METRICS_FILE"
+          )"
+
+          MAE="$(
+            jq -r '.MAE // .mae // .metrics.MAE // .metrics.mae // "unknown"' \
+              "$METRICS_FILE"
+          )"
+
+          RMSE_RATIO="$(
+            jq -r '
+              .RMSE_RATIO //
+              .rmse_ratio //
+              .metrics.RMSE_RATIO //
+              .metrics.rmse_ratio //
+              "unknown"
+            ' "$METRICS_FILE"
+          )"
+
+          if [[ "$VALIDATION_STATUS" == "false" ]]; then
+            echo "::warning title=Candidate $ITER failed validation::R2=$R2, MAPE=$MAPE, MAE=$MAE, RMSE ratio=$RMSE_RATIO"
+          fi
+
+          {
+            echo "## Candidate $ITER"
+            echo
+            echo "- Azure ML job: \`$JOB_NAME\`"
+            echo "- Passed metric gates: \`$VALIDATION_STATUS\`"
+            echo "- R2: \`$R2\`"
+            echo "- MAPE: \`$MAPE\`"
+            echo "- MAE: \`$MAE\`"
+            echo "- RMSE ratio: \`$RMSE_RATIO\`"
+            echo
+            echo "## Generated reports"
+            echo
+            echo "| Report | Artifact | Retention |"
+            echo "|---|---|---:|"
+            echo "| Candidate $ITER metrics | \`training_job_${ITER}\` | 30 days |"
+            echo
+            echo "Report file: \`$METRICS_FILE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload training job data
+        uses: actions/upload-artifact@v4
+        with:
+          name: training_job_${{ matrix.cfg.iteration }}
+          path: job_eval_model_${{ steps.submit_job.outputs.job_name }}.json
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  train-challenger-model:
+    name: Select the best model and train on all data
+    needs: train-models
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    env:
+      FINAL_JOB_YAML: azureml/final-job.yaml
+    outputs:
+      challenger_model: ${{ steps.submit_job.outputs.job_name }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Verify Azure login
+        run: az account show
+
+      - name: Download candidate training artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: training_job_*
+          path: training_jobs
+          merge-multiple: true
+      
+      - name: Check for passing models
+        run: |
+          set -euo pipefail
+
+          PASSING_MODELS=$(jq -s '[ .[] | select((.status|tostring)=="true") ]' training_jobs/*.json)
+          if [ "$(echo "$PASSING_MODELS" | jq length)" -eq 0 ]; then
+            echo "No models passed the validation criteria."
+            echo "::error title=No passing models::All candidate models failed validation thresholds. Stopping pipeline."
+            exit 1
+          else
+            echo "Found $(echo "$PASSING_MODELS" | jq length) passing models."
+          fi
+
+      - name: Compare results
+        id: select_winner
+        run: |
+          set -euo pipefail
+
+          jq -s '
+          map(
+            .R2 |= (try tonumber catch 0) |
+            .MAPE |= (try tonumber catch 1e9) |
+            .MAE |= (try tonumber catch 1e18) |
+            .RMSE_RATIO |= (try tonumber catch 1e9)
+          )
+          | [ .[] | select((.status|tostring)=="true") ]
+          | sort_by([ .RMSE_RATIO, .MAPE, .MAE, -(.R2) ])
+          | .[0]
+          ' training_jobs/*.json > winner.json
+
+          BEST_PERFORMER=$(jq -r '.job_name' winner.json)
+          BEST_ITERATION=$(jq -r '.iteration' winner.json)
+          ETA=$(jq -r '.hyperparameters.eta' winner.json)
+          MAX_DEPTH=$(jq -r '.hyperparameters.max_depth' winner.json)
+          N_ESTIMATORS=$(jq -r '.hyperparameters.n_estimators' winner.json)
+          SUBSAMPLE=$(jq -r '.hyperparameters.subsample' winner.json)
+          COLSAMPLE_BYTREE=$(jq -r '.hyperparameters.colsample_bytree' winner.json)
+          REG_ALPHA=$(jq -r '.hyperparameters.reg_alpha' winner.json)
+          REG_LAMBDA=$(jq -r '.hyperparameters.reg_lambda' winner.json)
+          R2="$(jq -r '.metrics.R2' winner.json)"
+          MAPE="$(jq -r '.metrics.MAPE' winner.json)"
+          MAE="$(jq -r '.metrics.MAE' winner.json)"
+          RMSE_RATIO="$(jq -r '.metrics.RMSE_RATIO' winner.json)"
+
+          echo "best_performer=$BEST_PERFORMER" >> "$GITHUB_OUTPUT"
+          echo "eta=$ETA" >> "$GITHUB_OUTPUT"
+          echo "max_depth=$MAX_DEPTH" >> "$GITHUB_OUTPUT"
+          echo "n_estimators=$N_ESTIMATORS" >> "$GITHUB_OUTPUT"
+          echo "subsample=$SUBSAMPLE" >> "$GITHUB_OUTPUT"
+          echo "colsample_bytree=$COLSAMPLE_BYTREE" >> "$GITHUB_OUTPUT"
+          echo "reg_alpha=$REG_ALPHA" >> "$GITHUB_OUTPUT"
+          echo "reg_lambda=$REG_LAMBDA" >> "$GITHUB_OUTPUT"
+
+          echo "Best performer: $BEST_PERFORMER"
+          echo "R2: $R2"
+          echo "MAPE: $MAPE"
+          echo "MAE: $MAE"
+          echo "RMSE ratio: $RMSE_RATIO"
+          echo "eta: $ETA"
+          echo "max_depth: $MAX_DEPTH"
+          echo "n_estimators: $N_ESTIMATORS"
+          echo "subsample: $SUBSAMPLE"
+          echo "colsample_bytree: $COLSAMPLE_BYTREE"
+          echo "reg_alpha: $REG_ALPHA"
+          echo "reg_lambda: $REG_LAMBDA"
+
+          echo "The best model is: "
+          cat winner.json
+          
+          {
+            echo "## Winning candidate"
+            echo
+            echo "- Azure ML job: \`$BEST_PERFORMER\`"
+            echo
+            echo "### Validation metrics"
+            echo
+            echo "| Metric | Value |"
+            echo "|---|---:|"
+            echo "| R2 | \`$R2\` |"
+            echo "| MAPE | \`$MAPE\` |"
+            echo "| MAE | \`$MAE\` |"
+            echo "| RMSE ratio | \`$RMSE_RATIO\` |"
+            echo
+            echo "### Hyperparameters"
+            echo
+            echo "| Hyperparameter | Value |"
+            echo "|---|---:|"
+            echo "| eta | \`$ETA\` |"
+            echo "| max depth | \`$MAX_DEPTH\` |"
+            echo "| estimators | \`$N_ESTIMATORS\` |"
+            echo "| subsample | \`$SUBSAMPLE\` |"
+            echo "| column sample by tree | \`$COLSAMPLE_BYTREE\` |"
+            echo "| regularisation alpha | \`$REG_ALPHA\` |"
+            echo "| regularisation lambda | \`$REG_LAMBDA\` |"
+            echo
+            echo "## Generated reports"
+            echo
+            echo "| Report | Artifact |"
+            echo "|---|---|"
+            echo "| Winning candidate data | \`winning_candidate\` |"
+            echo
+            echo "Report file: \`winner.json\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      
+      - name: Upload training job data
+        uses: actions/upload-artifact@v4
+        with:
+          name: winning_candidate
+          path: winner.json
+
+      - name: Create job template
+        env: 
+          ETA: ${{ steps.select_winner.outputs.eta }}
+          MAX_DEPTH: ${{ steps.select_winner.outputs.max_depth }}
+          N_ESTIMATORS: ${{ steps.select_winner.outputs.n_estimators }}
+          SUBSAMPLE: ${{ steps.select_winner.outputs.subsample }}
+          COLSAMPLE_BYTREE: ${{ steps.select_winner.outputs.colsample_bytree }}
+          REG_ALPHA: ${{ steps.select_winner.outputs.reg_alpha }}
+          REG_LAMBDA: ${{ steps.select_winner.outputs.reg_lambda }}
+          SCRIPT_NAME: "xgb_walmart_model_script.py"
+          COMPUTE_NAME: "${{ vars.TEST_PREFIX }}-compute"
+          DESCRIPTION: "Final Walmart model trained using best validated hyperparameters"
+          EXPERIMENT_NAME: "${{ vars.TEST_PREFIX }}_challenger_experiment"
+          CHALLENGER_MODEL: "--challenger_model"
+        run: |
+          set -euo pipefail
+          if [[ "${STORAGE_TYPE:-}" == "datalake" ]]; then
+              export WALMART_SALES_ASSET_URI=$DATALAKE_ASSET_URI
+              TEMPLATE="azureml/job_datalake.template.yaml"
+          elif [[ "${STORAGE_TYPE:-}" == "blobstore" ]]; then
+              export WALMART_SALES_ASSET_URI=$BLOBSTORAGE_ASSET_URL
+              TEMPLATE="azureml/job_blobstore.template.yaml"
+          else
+              echo "::error::STORAGE_TYPE must be either 'datalake' or 'blobstore'. Current value: '${STORAGE_TYPE:-<unset>}'"
+              exit 1
+          fi
+
+          envsubst '${WALMART_SALES_ASSET_URI} ${EXPERIMENT_NAME} ${DESCRIPTION} ${COMPUTE_NAME} ${SCRIPT_NAME} ${TRAINING_ENVIRONMENT} ${ETA} ${MAX_DEPTH} ${N_ESTIMATORS} ${SUBSAMPLE} ${COLSAMPLE_BYTREE} ${REG_ALPHA} ${REG_LAMBDA} ${CHALLENGER_MODEL}' < "$TEMPLATE" > "$FINAL_JOB_YAML"
+          cat $FINAL_JOB_YAML
+
+      - name: Submit Azure ML job to rebuild job with more data
+        id: submit_job
+        run: |
+          set -euo pipefail
+          JOB_STATUS_JSON=$(az ml job create --file "$FINAL_JOB_YAML" \
+                              --resource-group "$RG" \
+                              --workspace-name "$WORKSPACE_NAME" \
+                              -o json)
+          JOB_NAME=$(echo "$JOB_STATUS_JSON" | jq -r '.name')
+          JOB_STATUS=$(echo "$JOB_STATUS_JSON" | jq -r '.status')
+          echo "Job $JOB_NAME was created with status $JOB_STATUS"
+          echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Stream job logs
+        run: |
+          set -euo pipefail
+          az ml job stream --name "${{ steps.submit_job.outputs.job_name }}" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME"
+          # If the job failed, 'az ml job stream' will exit non-zero
+          echo "Training job "${{ steps.submit_job.outputs.job_name }}" completed successfully."
+  champion-challenger-testing:
+    name: Champion/Challenger testing for real-time endpoint
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    needs: [train-challenger-model, get-endpoint-names, retrieve-last-date]
+    runs-on: ubuntu-latest
+    env: 
+      JOB_NAME: ${{ needs.train-challenger-model.outputs.challenger_model }}
+      RT_ENDPOINT_NAME: ${{ needs.get-endpoint-names.outputs.rt_endpoint_name }}
+      LATEST_PROCESSED_DATE: ${{ needs.retrieve-last-date.outputs.latestdate }}
+      CHALLENGER_PREDICTIONS_FILE: challenger_predictions/artifacts/outputs/challenger_forecast_by_store.csv
+      CHAMPION_PREDICTIONS_FILE: ${{ github.workspace }}/champion-rt-response.json
+      ACTUAL_VALUES_FILE: ${{ github.workspace }}/Walmart_Sales_Actual.csv
+    outputs:
+      winner: ${{ steps.set_winner.outputs.winner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Verify Azure login
+        run: az account show
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Check if champion exists
+        id: check_champion
+        run: |
+          set -euo pipefail
+
+          echo "::group::Query endpoint traffic"
+          RT_TRAFFIC="$(
+            az ml online-endpoint show \
+              --name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query "traffic" \
+              --output json
+          )"
+
+          echo "Current traffic allocation:"
+          jq . <<< "$RT_TRAFFIC"
+          echo "::endgroup::"
+
+          CHAMPION_RT_DEPLOYMENT_NAME="$(
+            jq --raw-output '
+              if type == "object" and length > 0 then
+                to_entries
+                | max_by(.value)
+                | .key
+              else
+                empty
+              end
+            ' <<< "$RT_TRAFFIC"
+          )"
+
+          if [[ -n "$CHAMPION_RT_DEPLOYMENT_NAME" &&
+                "$CHAMPION_RT_DEPLOYMENT_NAME" != "null" ]]; then
+            echo "champion_rt_deployment_exists=true" >> "$GITHUB_OUTPUT"
+            echo "champion_rt_deployment_name=$CHAMPION_RT_DEPLOYMENT_NAME" \
+              >> "$GITHUB_OUTPUT"
+
+            CHAMPION_TRAFFIC="$(
+              jq --raw-output \
+                --arg deployment "$CHAMPION_RT_DEPLOYMENT_NAME" \
+                '.[$deployment]' \
+                <<< "$RT_TRAFFIC"
+            )"
+
+            echo "Champion real-time deployment exists: $CHAMPION_RT_DEPLOYMENT_NAME"
+            echo "Traffic allocation: ${CHAMPION_TRAFFIC}%"
+          else
+            echo "champion_rt_deployment_exists=false" >> "$GITHUB_OUTPUT"
+            echo "champion_rt_deployment_name=" >> "$GITHUB_OUTPUT"
+            echo "No deployment receives traffic for endpoint '$RT_ENDPOINT_NAME'."
+          fi
+
+      - name: Get Champion predictions
+        if: ${{ steps.check_champion.outputs.champion_rt_deployment_exists == 'true' }}
+        run: |
+         set -euo pipefail 
+         CHAMPION_RT_DEPLOYMENT_NAME="${{ steps.check_champion.outputs.champion_rt_deployment_name }}"
+
+          REQUEST_FILE="${RUNNER_TEMP}/rt-request.json"
+          RAW_RESPONSE_FILE="${RUNNER_TEMP}/rt-raw-response.json"
+
+          echo "::group::Prepare champion request"
+          echo "Endpoint:   $RT_ENDPOINT_NAME"
+          echo "Deployment: $CHAMPION_RT_DEPLOYMENT_NAME"
+          PREVIOUS_PROCESSED_DATE="$(
+            python3 -c 'from datetime import datetime, timedelta; import sys; value = datetime.strptime(sys.argv[1], "%d-%m-%Y") - timedelta(days=7); print(value.strftime("%d-%m-%Y"))' "$LATEST_PROCESSED_DATE"
+          )"
+
+          echo "Previous processed date: $PREVIOUS_PROCESSED_DATE"
+          
+
+          jq \
+            --arg date "$PREVIOUS_PROCESSED_DATE" \
+            --null-input \
+            '{
+                input_data: [
+                    range(1; 46) as $store
+                    | {
+                        Store: $store,
+                        Date: $date
+                    }
+                ]
+            }' > "$REQUEST_FILE"
+
+          REQUEST_COUNT="$(jq '.input_data | length' "$REQUEST_FILE")"
+
+          echo "Request file: $REQUEST_FILE"
+          echo "Store count:  $REQUEST_COUNT"
+
+          if [[ "$REQUEST_COUNT" -ne 45 ]]; then
+            echo "::endgroup::"
+            echo "::error title=Invalid champion request::Expected 45 stores but generated $REQUEST_COUNT"
+            exit 1
+          fi
+
+          jq . "$REQUEST_FILE"
+          echo "::endgroup::"
+          
+          echo "::group::Invoke champion deployment"
+          if ! az ml online-endpoint invoke \
+            --name "$RT_ENDPOINT_NAME" \
+            --deployment-name "$CHAMPION_RT_DEPLOYMENT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --request-file "$REQUEST_FILE" \
+            --output json > "$RAW_RESPONSE_FILE"; then
+
+            echo "::error title=Endpoint invocation failed::Azure CLI could not invoke the deployment."
+
+            az ml online-deployment get-logs \
+              --name "$CHAMPION_RT_DEPLOYMENT_NAME" \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --lines 200 || true
+
+            exit 1
+          fi
+
+          if [[ ! -s "$RAW_RESPONSE_FILE" ]]; then
+            echo "::error title=Empty endpoint response::The endpoint returned no content."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+
+          echo "::group::Process champion response"
+          
+          jq -r 'fromjson' "$RAW_RESPONSE_FILE" > "$CHAMPION_PREDICTIONS_FILE"
+
+          if [[ ! -s "$CHAMPION_PREDICTIONS_FILE" ]]; then
+            echo "::error title=Missing predictions::Champion predictions were not created."
+            exit 1
+          fi
+
+          CHAMPION_PREDICTION_COUNT="$(
+            jq '
+              if type == "array" then
+                length
+              elif .predictions? | type == "array" then
+                .predictions | length
+              else
+                0
+              end
+            ' "$CHAMPION_PREDICTIONS_FILE"
+          )"
+          echo "Predictions file:  $CHAMPION_PREDICTIONS_FILE"
+          echo "Prediction count:  $CHAMPION_PREDICTION_COUNT"
+          jq . "$CHAMPION_PREDICTIONS_FILE"
+          echo "::endgroup::"
+      
+      - name: Download challenger predictions
+        run: | 
+          set -euo pipefail
+          echo "::group::Download challenger job outputs"
+          echo "Azure ML job: $JOB_NAME"
+          az ml job download \
+            --name "$JOB_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --download-path "challenger_predictions"
+
+          ls challenger_predictions/artifacts/outputs
+
+          if [[ ! -s "$CHALLENGER_PREDICTIONS_FILE" ]]; then
+            echo "::error title=Missing file::$CHALLENGER_PREDICTIONS_FILE was not found"
+            exit 1
+          fi
+
+          echo "Challenger predictions found: $CHALLENGER_PREDICTIONS_FILE"
+          echo "::endgroup::"
+          echo "::group::Inspect challenger outputs"
+          ROW_COUNT="$(
+            python3 -c 'import pandas as pd, sys; print(len(pd.read_csv(sys.argv[1])))' "$CHALLENGER_PREDICTIONS_FILE"
+          )"
+          echo "Row count: $ROW_COUNT"
+          head -n 6 "$CHALLENGER_PREDICTIONS_FILE"
+          echo "::endgroup::"
+
+      - name: Set winner
+        id: set_winner
+        run: |
+          set -euo pipefail
+          CHAMPTION_RT_DEPLOYMENT_EXISTS=${{ steps.check_champion.outputs.champion_rt_deployment_exists }}
+          if [[ "$CHAMPTION_RT_DEPLOYMENT_EXISTS" == "false" ]]; then
+            echo "winner=challenger" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Champion/challenger result"
+              echo
+              echo "| Property | Value |"
+              echo "|---|---|"
+              echo "| Winner | \`challenger\` |"
+              echo "| Reason | No existing champion deployment |"
+              echo "| Challenger job | \`$JOB_NAME\` |"
+              echo "| Endpoint | \`$RT_ENDPOINT_NAME\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            python src/pipeline_scripts/select_winner.py \
+              --challenger-predictions "$CHALLENGER_PREDICTIONS_FILE" \
+              --champion-predictions "$CHAMPION_PREDICTIONS_FILE" \
+              --github-output "$GITHUB_OUTPUT"
+
+            if [[ ! -s "challenger_champion_summary.txt" ]]; then
+              echo "::endgroup::"
+              echo "::error title=Missing comparison summary::challenger_champion_summary.txt was not created"
+              exit 1
+            fi
+            cat "challenger_champion_summary.txt" >> "$GITHUB_STEP_SUMMARY"
+
+          fi
+
+          # TO BE REMOVED FOR TESTING OMLY
+          # echo "winner=challenger" >> "$GITHUB_OUTPUT"
+      
+      - name: Upload champion-challenger comparison files
+        if: ${{ steps.check_champion.outputs.champion_rt_deployment_exists == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: champion-challenger-comparison
+          path: |
+            challenger_champion_summary.txt
+            challenger_champion_comparison.csv
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  register-challenger-model:
+     name: Register model in Azure ML
+     needs: [train-challenger-model, champion-challenger-testing]
+     if: ${{ success() && github.ref == 'refs/heads/main' }}
+     runs-on: ubuntu-latest
+     outputs:
+      model_version: ${{ steps.register_model.outputs.model_version }}
+     env:
+       MLFLOW_ARTIFACT_PATH: model
+       MODEL_DESCRIPTION: "XGBoost sales forecast model (auto-versioned)"
+       MODEL_YAML: azureml/model.yaml
+       WINNER: ${{ needs.champion-challenger-testing.outputs.winner }}
+       JOB_NAME: ${{ needs.train-challenger-model.outputs.challenger_model }}
+     steps:
+        - uses: actions/checkout@v6
+
+        - name: Login into Azure
+          uses: azure/login@v2
+          with:
+            creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+        - name: Verify Azure login
+          run: az account show
+
+        - name: Ensure az ml extension is installed
+          run: |
+              az extension add -n ml -y || az extension update -n ml -y
+
+        - name: Render Azure ML job YAML from template
+          run: |
+            set -euo pipefail
+            
+            TEMPLATE=azureml/model.template.yaml
+            envsubst '${JOB_NAME} ${MODEL_NAME} ${MODEL_DESCRIPTION}' < "$TEMPLATE" > "$MODEL_YAML"
+            echo "Creatng yaml for MLflow model ${MODEL_NAME} from $JOB_NAME"
+            cat "$MODEL_YAML"
+
+        - name: Register model from latest job
+          id: register_model
+          run: |
+            set -euo pipefail
+              
+            echo "Registering model"
+
+            if [[ "$WINNER" == "challenger" ]]; then
+              DESCRIPTION="Challenger model registered after winning the champion-challenger test"
+              PROMOTION_STATUS="accepted"
+            else
+              DESCRIPTION="Challenger model registered after losing the champion-challenger test"
+              PROMOTION_STATUS="rejected"
+            fi
+
+            MODEL_JSON=$(az ml model create --file "$MODEL_YAML" --description "$DESCRIPTION" --set tags.promotion_status=$PROMOTION_STATUS --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" -o json)
+            MODEL_VERSION=$(echo "$MODEL_JSON" | jq -r '.version')  
+            echo "model_version=$MODEL_VERSION" >> "$GITHUB_OUTPUT"
+            echo "Challenger model $MODEL_NAME was registered with version $MODEL_VERSION"
+            {
+              echo "## Challenger model registration"
+              echo
+              echo "| Property | Value |"
+              echo "|---|---|"
+              echo "| Model | \`$MODEL_NAME:$MODEL_VERSION\` |"
+              echo "| Source job | \`$JOB_NAME\` |"
+              echo "| Champion/challenger winner | \`$WINNER\` |"
+              echo "| Promotion status | \`$PROMOTION_STATUS\` |"
+              echo "| Resource group | \`$RG\` |"
+              echo "| Workspace | \`$WORKSPACE_NAME\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+  create-rt-endpoint-deployment:
+    name: Create real-time endpoint deployment for the new model
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.champion-challenger-testing.outputs.winner == 'challenger' }}
+    needs: [register-challenger-model, champion-challenger-testing, get-endpoint-names, retrieve-last-date]
+    outputs:
+      rt_deployment_name: ${{ steps.create-rt-endpoint-deployment.outputs.rt_deployment_name }}
+    env:
+      RT_DEPLOYMENT_YAML: azureml/rt-deployment.yaml
+      MODEL_VERSION: ${{ needs.register-challenger-model.outputs.model_version }}
+      RT_ENDPOINT_NAME: ${{ needs.get-endpoint-names.outputs.rt_endpoint_name }}
+      LATEST_PROCESSED_DATE: ${{ needs.retrieve-last-date.outputs.latestdate }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Verify Azure login
+        run: az account show
+
+      - name: Create deployment
+        id: create-rt-endpoint-deployment
+        run: |
+          set -euo pipefail
+          timestamp=$(date -u +'%Y%m%d-%H%M%S')
+          RT_DEPLOYMENT_NAME="rt-deployment-$timestamp"
+          echo "rt_deployment_name=$RT_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+          echo "RT_DEPLOYMENT_NAME=$RT_DEPLOYMENT_NAME" >> "$GITHUB_ENV"
+          SCORE_SCRIPT="walmart_realtime_score.py"
+
+
+          #INSTANCE_TYPE="Standard_DS3_v2"
+          #INSTANCE_TYPE="Standard_DS2_v2"
+          INSTANCE_TYPE="Standard_F4s_v2"
+
+          echo "::group::Deployment configuration"
+          echo "Endpoint:            $RT_ENDPOINT_NAME"
+          echo "Deployment:          $RT_DEPLOYMENT_NAME"
+          echo "Model:               ${MODEL_NAME}:${MODEL_VERSION}"
+          echo "Instance type:       $INSTANCE_TYPE"
+          echo "Endpoint environment: $ENDPOINT_ENVIRONMENT"
+          echo "Feature data asset:  $FEATURE_DATA_ASSET_NAME"
+          echo "Scoring script:      $SCORE_SCRIPT"
+          echo "Resource group:      $RG"
+          echo "Workspace:           $WORKSPACE_NAME"
+          echo "Rendered YAML:       $RT_DEPLOYMENT_YAML"
+          echo "::endgroup::"
+
+          echo "::group::Resolve Azure resources"
+          SUBSCRIPTION_ID="$(
+            az account show \
+              --query id \
+              --output tsv
+          )"
+
+          if [[ -z "${FEATURE_DATA_ASSET_VERSION:-}" ]]; then
+            FEATURE_DATA_ASSET_VERSION="$(
+              az ml data show \
+                --name "$FEATURE_DATA_ASSET_NAME" \
+                --label latest \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --query version \
+                --output tsv
+            )"
+          fi
+
+           if [[ -z "$SUBSCRIPTION_ID" ]]; then
+            echo "::error::Could not determine the Azure subscription ID."
+            exit 1
+          fi
+
+          if [[ -z "$FEATURE_DATA_ASSET_VERSION" ]]; then
+            echo "::error::Could not determine the engineered feature data version."
+            exit 1
+          fi
+
+          # Verify that this exact asset version exists before creating
+          # the deployment.
+          FEATURE_DATA_ASSET_VERSION="$(
+              az ml data show \
+                --name "$FEATURE_DATA_ASSET_NAME" \
+                --label latest \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --query version \
+                --output tsv
+          )"
+          if [[ -z "$FEATURE_DATA_ASSET_VERSION" ]]; then
+            echo "::error title=Missing feature data version::Could not determine the engineered feature data version"
+            exit 1
+          fi
+
+          echo "Real-time deployment: $RT_DEPLOYMENT_NAME"
+          echo "Instance type: $INSTANCE_TYPE"
+          echo "Model: ${MODEL_NAME}:${MODEL_VERSION}"
+          echo "Feature data: ${FEATURE_DATA_ASSET_NAME}:${FEATURE_DATA_ASSET_VERSION}"
+          echo "::endgroup::"
+          
+          echo "RT_DEPLOYMENT_NAME=$RT_DEPLOYMENT_NAME" >> $GITHUB_ENV
+          echo "rt_deployment_name=$RT_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+          echo "FEATURE_DATA_ASSET_VERSION=$FEATURE_DATA_ASSET_VERSION" >> "$GITHUB_ENV"
+
+          echo "::group::Render Azure ML model YAML"
+          SCORE_SCRIPT="walmart_realtime_score.py"
+
+          export SUBSCRIPTION_ID FEATURE_DATA_ASSET_NAME FEATURE_DATA_ASSET_VERSION RT_DEPLOYMENT_NAME INSTANCE_TYPE SCORE_SCRIPT
+          envsubst \
+            '${INSTANCE_TYPE}
+            ${RT_DEPLOYMENT_NAME}
+            ${RT_ENDPOINT_NAME}
+            ${MODEL_NAME}
+            ${MODEL_VERSION}
+            ${ENDPOINT_ENVIRONMENT}
+            ${SUBSCRIPTION_ID}
+            ${RG}
+            ${WORKSPACE_NAME}
+            ${FEATURE_DATA_ASSET_NAME}
+            ${FEATURE_DATA_ASSET_VERSION}
+            ${SCORE_SCRIPT}' \
+            < azureml/rt-deployment-template.yaml \
+            > "$RT_DEPLOYMENT_YAML"
+
+          if [[ ! -s "$RT_DEPLOYMENT_YAML" ]]; then
+            echo "::error::Deployment YAML was not generated."
+            exit 1
+          fi
+
+          echo "Generated deployment YAML:"
+          cat "$RT_DEPLOYMENT_YAML"
+          echo "::endgroup::"
+
+          echo "::group::Invoke real-time deployment"
+          RT_DEPLOYMENT_JSON=$(az ml online-deployment create --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --file "$RT_DEPLOYMENT_YAML" --output json)
+          echo "$RT_DEPLOYMENT_JSON"
+          RT_DEPLOYMENT_STATE=$(az ml online-deployment show --name "$RT_DEPLOYMENT_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --endpoint-name "$RT_ENDPOINT_NAME" --query "provisioning_state" -o tsv)
+          echo "$RT_DEPLOYMENT_STATE"
+          
+          if [[ "$RT_DEPLOYMENT_STATE" == "Succeeded" ]]; then
+              echo "Deployment '$RT_DEPLOYMENT_NAME' created successfully in endpoint '$RT_ENDPOINT_NAME'"
+          else
+              echo "Failed to create deployment '$RT_DEPLOYMENT_NAME' (provisioningState: $RT_DEPLOYMENT_STATE)"
+              az ml online-deployment get-logs \
+                --name "$RT_DEPLOYMENT_NAME" \
+                --endpoint-name "$RT_ENDPOINT_NAME" \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --lines 200 || true
+              exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Test real-time endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUEST_FILE="${RUNNER_TEMP}/walmart-endpoint-request.json"
+          RESPONSE_FILE="${RUNNER_TEMP}/walmart-endpoint-response.json"
+          RAW_RESPONSE_FILE="${RUNNER_TEMP}/walmart-endpoint-raw-response.json"
+
+          echo "::group::Prepare endpoint test"
+          if [[ -z "${LATEST_PROCESSED_DATE:-}" ]]; then
+              echo "::error::LATEST_PROCESSED_DATE is not set"
+              exit 1
+          fi
+
+          REQUEST_DATE="$LATEST_PROCESSED_DATE"
+
+          jq -n \
+              --arg date "$REQUEST_DATE" \
+              '{
+                  input_data: [
+                      {
+                          Store: 1,
+                          Date: $date
+                      }
+                  ]
+              }' > "$REQUEST_FILE"
+
+          echo "Request:"
+          jq . "$REQUEST_FILE"
+          echo "::endgroup::"
+
+          echo "::group::Invoke real-time deployment"
+          echo "Calling deployment: $RT_DEPLOYMENT_NAME"
+
+          if ! az ml online-endpoint invoke \
+            --name "$RT_ENDPOINT_NAME" \
+            --deployment-name "$RT_DEPLOYMENT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --request-file "$REQUEST_FILE" \
+            --output json > "$RAW_RESPONSE_FILE"; then
+
+            echo "::error title=Endpoint invocation failed::Azure CLI could not invoke the deployment."
+
+            az ml online-deployment get-logs \
+              --name "$RT_DEPLOYMENT_NAME" \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --lines 200 || true
+
+            exit 1
+          fi
+          echo "::endgroup::"
+          
+          echo "::group::Process endpoint response"
+          if [[ ! -s "$RAW_RESPONSE_FILE" ]]; then
+            echo "::error title=Empty endpoint response::The endpoint returned no content."
+            exit 1
+          fi
+
+          jq -r 'fromjson' "$RAW_RESPONSE_FILE" > "$RESPONSE_FILE"
+
+          echo "Endpoint response:"
+          jq . "$RESPONSE_FILE"
+
+          # 1. Check for API/Model errors
+          if jq -e 'has("error")' "$RESPONSE_FILE" >/dev/null; then
+            ERROR_TYPE="$(jq -r '.error' "$RESPONSE_FILE")"
+            ERROR_MESSAGE="$(jq -r '.message // "No error message returned"' "$RESPONSE_FILE")"
+
+            echo "::error title=Endpoint scoring failed::$ERROR_TYPE: $ERROR_MESSAGE"
+            exit 1
+          fi
+
+
+          # 2. Validate response structure and field presence
+          jq -e \
+            --arg request_date "$REQUEST_DATE" \
+            '
+              (.predictions | type == "array") and
+              (.predictions | length > 0) and
+              (.predictions[0].Store == 1) and
+              (.predictions[0].Feature_Date == $request_date) and
+              (.predictions[0] | has("Prediction_Date")) and
+              (.predictions[0] | has("Predicted_Weekly_Sales")) and
+              (.predictions[0].Predicted_Weekly_Sales != null)
+            ' "$RESPONSE_FILE" >/dev/null || {
+              echo "::error title=Invalid endpoint response::The response structure did not match the expected format."
+              exit 1
+            }
+
+
+          # 3. Extract variables safely
+          STORE="$(jq -r '.predictions[0].Store' "$RESPONSE_FILE")"
+          FEATURE_DATE="$(jq -r '.predictions[0].Feature_Date' "$RESPONSE_FILE")"
+          PREDICTION_DATE="$(jq -r '.predictions[0].Prediction_Date' "$RESPONSE_FILE")"
+          PREDICTED_SALES="$(jq -r '.predictions[0].Predicted_Weekly_Sales' "$RESPONSE_FILE")"
+          echo "::endgroup::"
+
+
+          echo "Endpoint test succeeded."
+          echo "Store: $STORE"
+          echo "Feature date: $FEATURE_DATE"
+          echo "Prediction date: $PREDICTION_DATE"
+          echo "Predicted weekly sales: $PREDICTED_SALES"
+        
+          {
+            echo "## Real-time deployment"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`$RT_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$RT_DEPLOYMENT_NAME\` |"
+            echo "| Provisioning state | \`Succeeded\` |"
+            echo "| Model | \`${MODEL_NAME}:${MODEL_VERSION}\` |"
+            echo "| Feature data | \`${FEATURE_DATA_ASSET_NAME}:${FEATURE_DATA_ASSET_VERSION}\` |"
+            echo "| Instance type | \`Standard_F4s_v2\` |"
+            echo
+            echo "### Smoke test"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Status | Passed |"
+            echo "| Store | \`$STORE\` |"
+            echo "| Feature date | \`$FEATURE_DATE\` |"
+            echo "| Prediction date | \`$PREDICTION_DATE\` |"
+            echo "| Predicted weekly sales | \`$PREDICTED_SALES\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+  locust-load-test:
+    name: Load test real-time endpoint with Locust
+    needs: [create-rt-endpoint-deployment, get-endpoint-names]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    env:
+      RT_ENDPOINT_NAME: ${{ needs.get-endpoint-names.outputs.rt_endpoint_name }}
+      RT_DEPLOYMENT_NAME: ${{ needs.create-rt-endpoint-deployment.outputs.rt_deployment_name }}
+      LOCUST_USERS: 5          # concurrent simulated users
+      LOCUST_SPAWN_RATE: 1     # users per second
+      LOCUST_RUN_TIME: 60s       # total duration
+      LOCUST_P95_MAX_MS: 1000   # 1.5s max p95 latency
+      LOCUST_MAX_FAIL_RATIO: 0.05  # 5% max failure ratio
+      LOCUST_STATS_FILE: locust/locust-summary.json
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Verify Azure login
+        run: az account show
+
+      - name: Get scoring URI and token details
+        id: get_endpoint_creds
+        run: |
+         set -euo pipefail 
+         SCORE_URI=$(az ml online-endpoint show \
+            --name "$RT_ENDPOINT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --query "scoring_uri" -o tsv)
+
+          TOKEN=$(az ml online-endpoint get-credentials \
+            --name "$RT_ENDPOINT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --query primaryKey -o tsv)
+          
+          echo "::add-mask::$TOKEN"
+
+          if [[ -z "$SCORE_URI" ]]; then
+            echo "::error title=Missing scoring URI::Azure ML did not return a scoring URI"
+            exit 1
+          fi
+
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error title=Missing endpoint credential::Azure ML did not return an endpoint key"
+            exit 1
+          fi
+
+          echo "SCORE_URI=$SCORE_URI" >> $GITHUB_ENV
+          echo "AZUREML_TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Locust
+        run: |
+          set -euo pipefail
+
+          echo "::group::Install Locust"
+          python -m pip install --upgrade pip
+          python -m pip install locust
+          echo "::endgroup::"
+
+          echo "::group::Verify Locust environment"
+          python --version
+          python -m pip --version
+          locust --version
+          echo "::endgroup::"
+
+      - name: Run Locust load test against new deployment
+        env:
+          AZUREML_DEPLOYMENT: ${{ env.RT_DEPLOYMENT_NAME }}
+          LOCUST_STATS_FILE: locust/locust-summary.json
+        run: |
+          set -euo pipefail
+          echo "::group::Run Locust load test"
+          echo "Target URI:       $SCORE_URI"
+          echo "Deployment:       $RT_DEPLOYMENT_NAME"
+          echo "Users:            $LOCUST_USERS"
+          echo "Spawn rate:       $LOCUST_SPAWN_RATE users/second"
+          echo "Duration:         $LOCUST_RUN_TIME"
+          echo "p95 threshold:    ${LOCUST_P95_MAX_MS} ms"
+          echo "Failure threshold: $LOCUST_MAX_FAIL_RATIO"
+
+          echo "Running Locust against $SCORE_URI for deployment $RT_DEPLOYMENT_NAME"
+
+          mkdir -p locust
+          STATUS="unknown"
+          REQUEST_COUNT="unknown"
+          FAILURE_COUNT="unknown"
+          FAILURE_RATIO="unknown"
+          REQUESTS_PER_SECOND="unknown"
+          AVERAGE_RESPONSE_TIME="unknown"
+          P95_RESPONSE_TIME="unknown"
+          # Locust host is the full AzureML scoring URI; we call path ""
+          set +e
+          locust \
+            --locustfile src/pipeline_scripts/locust_load_test.py \
+            --headless \
+            --host "$SCORE_URI" \
+            --users "$LOCUST_USERS" \
+            --spawn-rate "$LOCUST_SPAWN_RATE" \
+            --run-time "$LOCUST_RUN_TIME" \
+            --csv locust/locust \
+            --csv-full-history \
+            --html locust/locust-report.html \
+            --logfile locust/locust.log \
+            --loglevel INFO
+          LOCUST_EXIT_CODE="$?"
+          set -e
+          echo "::endgroup::"
+
+          echo "::group::Load-test results"
+          if [[ -s "$LOCUST_STATS_FILE" ]] &&
+             jq empty "$LOCUST_STATS_FILE" 2>/dev/null; then
+            STATUS="$(jq -r '.status' "$LOCUST_STATS_FILE")"
+            REQUEST_COUNT="$(jq -r '.requests' "$LOCUST_STATS_FILE")"
+            FAILURE_COUNT="$(jq -r '.failures' "$LOCUST_STATS_FILE")"
+            FAILURE_RATIO="$(jq -r '.failure_ratio' "$LOCUST_STATS_FILE")"
+            REQUESTS_PER_SECOND="$(
+              jq -r '.requests_per_second // "unknown"' \
+                "$LOCUST_STATS_FILE"
+            )"
+            AVERAGE_RESPONSE_TIME="$(
+              jq -r '.average_response_time_ms // "unknown"' \
+                "$LOCUST_STATS_FILE"
+            )"
+            P95_RESPONSE_TIME="$(
+              jq -r '.p95_response_time_ms // "unknown"' \
+                "$LOCUST_STATS_FILE"
+            )"
+
+            jq . "$LOCUST_STATS_FILE"
+          else
+            echo "::warning title=Missing Locust summary::$LOCUST_STATS_FILE was not created or is invalid"
+          fi
+
+          echo
+          echo "Status:                $STATUS"
+          echo "Exit code:             $LOCUST_EXIT_CODE"
+          echo "Requests:              $REQUEST_COUNT"
+          echo "Failures:              $FAILURE_COUNT"
+          echo "Failure ratio:         $FAILURE_RATIO"
+          echo "Requests per second:   $REQUESTS_PER_SECOND"
+          echo "Average response time: ${AVERAGE_RESPONSE_TIME} ms"
+          echo "p95 response time:     ${P95_RESPONSE_TIME} ms"
+          echo "::endgroup::"
+
+          {
+            echo "## Real-time endpoint load test"
+            echo
+            echo "| Configuration | Value |"
+            echo "|---|---:|"
+            echo "| Endpoint | \`$RT_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$RT_DEPLOYMENT_NAME\` |"
+            echo "| Users | \`$LOCUST_USERS\` |"
+            echo "| Spawn rate | \`${LOCUST_SPAWN_RATE} users/second\` |"
+            echo "| Duration | \`$LOCUST_RUN_TIME\` |"
+            echo "| Maximum p95 latency | \`${LOCUST_P95_MAX_MS} ms\` |"
+            echo "| Maximum failure ratio | \`$LOCUST_MAX_FAIL_RATIO\` |"
+            echo
+            echo "### Results"
+            echo
+            echo "| Metric | Result |"
+            echo "|---|---:|"
+            echo "| Status | \`$STATUS\` |"
+            echo "| Exit code | \`$LOCUST_EXIT_CODE\` |"
+            echo "| Requests | \`$REQUEST_COUNT\` |"
+            echo "| Failures | \`$FAILURE_COUNT\` |"
+            echo "| Failure ratio | \`$FAILURE_RATIO\` |"
+            echo "| Requests per second | \`$REQUESTS_PER_SECOND\` |"
+            echo "| Average response time | \`${AVERAGE_RESPONSE_TIME} ms\` |"
+            echo "| p95 response time | \`${P95_RESPONSE_TIME} ms\` |"
+            echo
+            echo "## Generated reports"
+            echo
+            echo "| Report | Artifact |"
+            echo "|---|---|"
+            echo "| Locust HTML, CSV, JSON and log reports | \`locust-load-test-${{ github.run_id }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "locust_exit_code=$LOCUST_EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [[ "$LOCUST_EXIT_CODE" -ne 0 ]]; then
+            echo "::error title=Locust load test failed::Status=$STATUS, exit code=$LOCUST_EXIT_CODE, p95=${P95_RESPONSE_TIME} ms, failure ratio=$FAILURE_RATIO"
+            exit "$LOCUST_EXIT_CODE"
+          fi
+      
+      - name: List generated Locust reports
+        if: ${{ always() }}
+        shell: bash
+        run: |
+         set -euo pipefail 
+         echo "::group::Generated Locust reports"
+
+          if [[ -d locust ]]; then
+            find locust \
+              -maxdepth 1 \
+              -type f \
+              -printf '%f (%s bytes)\n' |
+              sort
+          else
+            echo "::warning title=Missing reports directory::locust was not created"
+          fi
+
+          echo "::endgroup::"
+
+      - name: Upload Locust reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: locust-load-test-${{ github.run_id }}
+          path: locust/
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}  
+  update-traffic:
+    name: Update traffic to new endpoint
+    needs: [locust-load-test, create-rt-endpoint-deployment, get-endpoint-names]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    env:
+      RT_ENDPOINT_NAME: ${{ needs.get-endpoint-names.outputs.rt_endpoint_name }}
+      RT_DEPLOYMENT_NAME: ${{ needs.create-rt-endpoint-deployment.outputs.rt_deployment_name }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Verify Azure login
+        run: az account show
+      
+      - name: Current traffic allocation
+        run: |
+         set -euo pipefail 
+         CURRENT_TRAFFIC_JSON="$(
+            az ml online-endpoint show \
+              --name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query traffic \
+              --output json
+          )"
+
+          if [[ "$(jq 'length' <<< "$CURRENT_TRAFFIC_JSON")" -eq 0 ]]; then
+            echo "No deployment currently receives endpoint traffic."
+          else
+            jq -r '
+              ["DEPLOYMENT", "TRAFFIC"],
+              (
+                to_entries[]
+                | [.key, "\(.value)%"]
+              )
+              | @tsv
+            ' <<< "$CURRENT_TRAFFIC_JSON" |
+              column -t -s $'\t'
+          fi
+
+          PREVIOUS_TRAFFIC="$(
+            jq --compact-output '.' <<< "$CURRENT_TRAFFIC_JSON"
+          )"
+          echo "PREVIOUS_TRAFFIC=$PREVIOUS_TRAFFIC" >> $GITHUB_ENV
+
+
+      - name: Update traffic
+        run: |
+          set -euo pipefail
+          echo "Endpoint:       $RT_ENDPOINT_NAME"
+          echo "New deployment: $RT_DEPLOYMENT_NAME"
+          echo "Target traffic: 100%"
+          echo "Resource group: $RG"
+          echo "Workspace:      $WORKSPACE_NAME"
+
+
+          RT_TRAFFIC_JSON=$(az ml online-endpoint update -n "$RT_ENDPOINT_NAME" --traffic "$RT_DEPLOYMENT_NAME=100" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME")
+          RT_TRAFFIC_STATE=$(echo "$RT_TRAFFIC_JSON" | jq -r '.provisioning_state')
+          echo "RT_TRAFFIC_STATE=$RT_TRAFFIC_STATE" >> $GITHUB_ENV
+          if [[ "$RT_TRAFFIC_STATE" == "Succeeded" ]]; then
+              echo "Traffic for deployment '$RT_DEPLOYMENT_NAME' updated successfully in resource group '$RG'"
+          else
+              echo "Failed to update deployment '$RT_DEPLOYMENT_NAME' traffic (provisioningState: $RT_TRAFFIC_STATE)"
+              exit 1
+          fi
+
+      - name: Verify final traffic allocation
+        run: |
+            set -euo pipefail
+            ENDPOINT_JSON="$(
+              az ml online-endpoint show \
+                --name "$RT_ENDPOINT_NAME" \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --output json
+            )"
+
+            FINAL_STATE="$(
+              jq -r '.provisioning_state // empty' <<< "$ENDPOINT_JSON"
+            )"
+
+            FINAL_TRAFFIC_JSON="$(
+              jq --compact-output '.traffic // {}' <<< "$ENDPOINT_JSON"
+            )"
+
+            TARGET_TRAFFIC="$(
+              jq --raw-output \
+                --arg deployment "$RT_DEPLOYMENT_NAME" \
+                '.traffic[$deployment] // 0' \
+                <<< "$ENDPOINT_JSON"
+            )"
+
+            TOTAL_TRAFFIC="$(
+              jq '
+                [.traffic[]?] | add // 0
+              ' <<< "$ENDPOINT_JSON"
+            )"
+
+            echo "Update response state: $RT_TRAFFIC_STATE"
+            echo "Final endpoint state:  $FINAL_STATE"
+            echo "Target deployment:     $RT_DEPLOYMENT_NAME"
+            echo "Target traffic:        ${TARGET_TRAFFIC}%"
+            echo "Total traffic:         ${TOTAL_TRAFFIC}%"
+            echo
+            echo "Final traffic allocation:"
+
+            jq -r '
+              ["DEPLOYMENT", "TRAFFIC"],
+              (
+                .traffic
+                | to_entries[]
+                | [.key, "\(.value)%"]
+              )
+              | @tsv
+            ' <<< "$ENDPOINT_JSON" |
+              column -t -s $'\t'
+
+            echo "::endgroup::"
+
+            if [[ "$FINAL_STATE" != "Succeeded" ]]; then
+              echo "::error title=Endpoint update failed::Endpoint provisioning state is '$FINAL_STATE'"
+              exit 1
+            fi
+
+            if [[ "$TARGET_TRAFFIC" -ne 100 ]]; then
+              echo "::error title=Incorrect traffic allocation::$RT_DEPLOYMENT_NAME received ${TARGET_TRAFFIC}% instead of 100%"
+              exit 1
+            fi
+
+            if [[ "$TOTAL_TRAFFIC" -ne 100 ]]; then
+              echo "::error title=Invalid total traffic::Endpoint traffic totals ${TOTAL_TRAFFIC}% instead of 100%"
+              exit 1
+            fi
+
+            {
+              echo "## Real-time endpoint traffic update"
+              echo
+              echo "| Property | Value |"
+              echo "|---|---|"
+              echo "| Endpoint | \`$RT_ENDPOINT_NAME\` |"
+              echo "| Active deployment | \`$RT_DEPLOYMENT_NAME\` |"
+              echo "| Traffic allocation | \`${TARGET_TRAFFIC}%\` |"
+              echo "| Endpoint state | \`$FINAL_STATE\` |"
+              echo "| Resource group | \`$RG\` |"
+              echo "| Workspace | \`$WORKSPACE_NAME\` |"
+              echo
+              echo "### Traffic change"
+              echo
+              echo "| Allocation | Value |"
+              echo "|---|---|"
+              echo "| Previous | \`$PREVIOUS_TRAFFIC\` |"
+              echo "| Current | \`$FINAL_TRAFFIC_JSON\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+  create-batch-endpoint-deployment:
+    name: Create batch endpoint deployment for the new model
+    needs: [update-traffic, get-endpoint-names, retrieve-last-date, register-challenger-model]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    env:
+      BATCH_DEPLOYMENT_TEMPLATE: azureml/batch-deployment-template.yaml
+      BATCH_DEPLOYMENT_YAML: azureml/batch-endpoint-deployment.yaml
+      BATCH_ENDPOINT_NAME: ${{ needs.get-endpoint-names.outputs.batch_endpoint_name }}
+      MODEL_VERSION: ${{ needs.register-challenger-model.outputs.model_version }}
+    outputs:
+      batch_deployment_name: ${{ steps.create_batch_deployment.outputs.batch_deployment_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Verify Azure login
+        run: az account show
+      
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Create deployment
+        id: create_batch_deployment
+        run: |
+          set -euo pipefail
+          TIMESTAMP="$(date -u +'%Y%m%d-%H%M%S')"
+          BATCH_DEPLOYMENT_NAME="batch-deployment-$TIMESTAMP"
+          BATCH_DEPLOYMENT_DESC="XGBoost Walmart sales batch deployment"
+          COMPUTE_NAME="${{ vars.TEST_PREFIX }}-compute"
+          SCORE_SCRIPT="walmart_batch_score.py"
+
+          echo "BATCH_DEPLOYMENT_NAME=$BATCH_DEPLOYMENT_NAME" >> $GITHUB_ENV
+          echo "batch_deployment_name=$BATCH_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+          
+          
+          echo "::group::Resolve and verify Azure resources"
+          SUBSCRIPTION_ID="$(
+              az account show \
+                  --query id \
+                  --output tsv
+          )"
+
+          FEATURE_DATA_ASSET_VERSION="$(
+              az ml data show \
+                --name "$FEATURE_DATA_ASSET_NAME" \
+                --label latest \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --query version \
+                --output tsv
+          )"
+          if [[ -z "$SUBSCRIPTION_ID" ]]; then
+            echo "::endgroup::"
+            echo "::error title=Missing subscription ID::Could not determine the Azure subscription ID"
+            exit 1
+          fi
+
+          if [[ -z "$FEATURE_DATA_ASSET_VERSION" ]]; then
+            echo "::endgroup::"
+            echo "::error title=Missing feature data version::Could not determine the latest feature-data version"
+            exit 1
+          fi
+          echo "FEATURE_DATA_ASSET_VERSION=$FEATURE_DATA_ASSET_VERSION" >> "$GITHUB_ENV"
+
+          echo "Subscription ID:      $SUBSCRIPTION_ID"
+          echo "Feature data version: $FEATURE_DATA_ASSET_VERSION"
+          echo "::endgroup::"
+
+
+          echo "::group::Render batch deployment YAML"
+          export BATCH_DEPLOYMENT_NAME BATCH_DEPLOYMENT_DESC COMPUTE_NAME SCORE_SCRIPT SUBSCRIPTION_ID FEATURE_DATA_ASSET_VERSION          
+          envsubst '${BATCH_DEPLOYMENT_NAME} ${BATCH_DEPLOYMENT_DESC} ${BATCH_ENDPOINT_NAME} ${MODEL_NAME} ${MODEL_VERSION} ${COMPUTE_NAME} ${ENDPOINT_ENVIRONMENT} ${SUBSCRIPTION_ID} ${RG} ${WORKSPACE_NAME} ${FEATURE_DATA_ASSET_NAME} ${FEATURE_DATA_ASSET_VERSION} ${SCORE_SCRIPT}' < azureml/batch-deployment-template.yaml > $BATCH_DEPLOYMENT_YAML
+          
+          if [[ ! -f "$BATCH_DEPLOYMENT_YAML" ]]; then
+            echo "::error title=Missing file::Batch endpoint deployment YAML not found at: $BATCH_DEPLOYMENT_YAML"
+            exit 1
+          fi
+          
+          cat $BATCH_DEPLOYMENT_YAML
+
+          echo "::endgroup::"
+
+          echo "::group::Create Azure ML batch deployment"
+          # --set-default # causes breakage
+          BATCH_DEPLOYMENT_JSON=$(az ml batch-deployment create --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --file "$BATCH_DEPLOYMENT_YAML")
+          
+          BATCH_DEPLOYMENT_STATE=$(echo "$BATCH_DEPLOYMENT_JSON" | jq -r '.provisioning_state')
+          
+          if [[ "$BATCH_DEPLOYMENT_STATE" == "Succeeded" ]]; then
+              echo "Batch deployment '$BATCH_DEPLOYMENT_NAME' created successfully in resource group '$RG'"
+          else
+              echo "Failed to create batch deployment '$BATCH_DEPLOYMENT_NAME' (provisioningState: $BATCH_DEPLOYMENT_STATE)"
+              exit 1
+          fi
+          echo "::endgroup::"
+      
+      - name: Run batch endpoint job
+        run: |
+          set -euo pipefail
+          echo "::group::Resolve batch input"
+          TEST_DATA_VERSION="$(
+            az ml data list \
+              --name test_data \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query "[].version" \
+              --output tsv |
+            sort --version-sort |
+            tail --lines=1
+          )"
+
+          if [[ -z "$TEST_DATA_VERSION" ]]; then
+            echo "::error title=Missing data asset::No versions of azureml:test_data were found."
+            exit 1
+          fi
+
+          TEST_DATA_ASSET="azureml:test_data:${TEST_DATA_VERSION}"
+
+          echo "Using batch input: $TEST_DATA_ASSET"
+          echo "::endgroup::"
+
+          echo "::group::Invoke batch endpoint"
+          BATCH_JOB=$(
+            az ml batch-endpoint invoke \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --deployment-name "$BATCH_DEPLOYMENT_NAME" \
+              --input "$TEST_DATA_ASSET" \
+              --input-type uri_file \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME"
+          )
+          echo "$BATCH_JOB"
+          BATCH_JOB_NAME=$(echo "$BATCH_JOB" | jq -r '.name')
+          az ml job stream -n "$BATCH_JOB_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME"
+
+          BATCH_JOB_STATUS="$(
+            az ml job show \
+              --name "$BATCH_JOB_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query status \
+              --output tsv
+          )"
+
+          if [[ "$BATCH_JOB_STATUS" != "Completed" ]]; then
+            echo "::error title=Batch job failed::$BATCH_JOB_NAME finished with status '$BATCH_JOB_STATUS'"
+            exit 1
+          fi
+
+          echo "BATCH_JOB_NAME=$BATCH_JOB_NAME" >> $GITHUB_ENV
+          echo "batch_job_name=$BATCH_JOB_NAME" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          {
+            echo "BATCH_JOB_NAME=$BATCH_JOB_NAME"
+            echo "TEST_DATA_VERSION=$TEST_DATA_VERSION"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate batch job output
+        id: validate_batch_output
+        run: |
+            set -euo pipefail
+            echo "::group::Download batch predictions"
+            PREDICTIONS_FILE="batch-results/predictions.csv"
+
+            az ml job download \
+              --name "$BATCH_JOB_NAME" \
+              --output-name score \
+              --download-path batch-results \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME"
+
+            if [[ ! -f "$PREDICTIONS_FILE" ]]; then
+              echo "::error title=Missing predictions::File not found: $PREDICTIONS_FILE"
+              exit 1
+            fi
+
+            echo "File found: $PREDICTIONS_FILE"
+
+            PREDICTION_COUNT=$(( $(wc -l < "$PREDICTIONS_FILE") - 1 ))
+            echo "prediction_count=$PREDICTION_COUNT" >> "$GITHUB_OUTPUT"
+
+            cat $PREDICTIONS_FILE
+            echo "::endgroup::"
+
+            echo "::group::Validate predictions"
+            set +e
+            python src/pipeline_scripts/validate_predictions.py $PREDICTIONS_FILE
+            VALIDATION_EXIT_CODE="$?"
+            set -e
+
+            if [[ "$VALIDATION_EXIT_CODE" -ne 0 ]]; then
+              echo "::error title=Prediction validation failed::$PREDICTIONS_FILE failed validation"
+              exit "$VALIDATION_EXIT_CODE"
+            fi
+            echo "::endgroup::"
+
+      - name: Set batch deployment as default
+        run: |
+          set -euo pipefail
+          echo "::group::Current default batch deployment"
+          PREVIOUS_DEFAULT="$(
+            az ml batch-endpoint show \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query defaults.deployment_name \
+              --output tsv
+          )"
+
+          echo "Previous default: ${PREVIOUS_DEFAULT:-none}"
+          echo "New default:      $BATCH_DEPLOYMENT_NAME"
+          echo "::endgroup::"
+
+          echo "::group::Update default batch deployment"
+          az ml batch-endpoint update \
+            --name "$BATCH_ENDPOINT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --set "defaults.deployment_name=$BATCH_DEPLOYMENT_NAME" \
+            --output none
+          echo "::endgroup::"
+
+          CURRENT_DEFAULT="$(
+            az ml batch-endpoint show \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query defaults.deployment_name \
+              --output tsv
+          )"
+
+          if [[ "$CURRENT_DEFAULT" != "$BATCH_DEPLOYMENT_NAME" ]]; then
+            echo "::error title=Default deployment update failed::Expected '$BATCH_DEPLOYMENT_NAME', found '${CURRENT_DEFAULT:-none}'"
+            exit 1
+          fi
+
+          {
+            echo "## Batch endpoint deployment"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`$BATCH_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$BATCH_DEPLOYMENT_NAME\` |"
+            echo "| Deployment state | \`Succeeded\` |"
+            echo "| Model | \`${MODEL_NAME}:${MODEL_VERSION}\` |"
+            echo "| Feature data | \`${FEATURE_DATA_ASSET_NAME}:${FEATURE_DATA_ASSET_VERSION}\` |"
+            echo "| Test-data version | \`$TEST_DATA_VERSION\` |"
+            echo "| Batch job | \`$BATCH_JOB_NAME\` |"
+            echo "| Prediction rows | \`${{ steps.validate_batch_output.outputs.prediction_count }}\` |"
+            echo "| Previous default | \`${PREVIOUS_DEFAULT:-none}\` |"
+            echo "| Current default | \`$CURRENT_DEFAULT\` |"
+            echo
+            echo "## Generated reports"
+            echo
+            echo "| Report | Artifact |"
+            echo "|---|---|"
+            echo "| Batch predictions | \`batch-predictions-${{ github.run_id }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: Upload batch predictions
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-predictions-${{ github.run_id }}
+          path: batch-results/
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  delete-orphan-deployments:
+    name: Delete old deployments
+    runs-on: ubuntu-latest
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    needs: [get-endpoint-names, create-batch-endpoint-deployment, update-traffic]
+    env:
+      BATCH_ENDPOINT_NAME: ${{ needs.get-endpoint-names.outputs.batch_endpoint_name }}
+      RT_ENDPOINT_NAME: ${{ needs.get-endpoint-names.outputs.rt_endpoint_name }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+  
+      - name: Ensure Azure ML CLI v2 extension
+        run: |
+          set -euo pipefail
+          az extension add -n ml -y || az extension update -n ml
+  
+      - name: Delete real-time deployments with no traffic
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Query real-time endpoint"
+          
+
+          TRAFFIC_JSON="$(
+            az ml online-endpoint show \
+              --name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query traffic \
+              --output json
+          )"
+
+          DEPLOYMENTS_JSON="$(
+            az ml online-deployment list \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].{
+                name:name,
+                state:provisioning_state,
+                instanceType:instance_type
+              }' \
+              --output json
+          )"
+
+          DEPLOYMENT_COUNT="$(jq 'length' <<< "$DEPLOYMENTS_JSON")"
+          TRAFFIC_TOTAL="$(jq '[.[]] | add // 0' <<< "$TRAFFIC_JSON")"
+
+          echo "Endpoint:         $RT_ENDPOINT_NAME"
+          echo "Resource group:   $RG"
+          echo "Workspace:        $WORKSPACE_NAME"
+          echo "Deployment count: $DEPLOYMENT_COUNT"
+          echo "Traffic total:    ${TRAFFIC_TOTAL}%"
+          echo
+          echo "Current deployments:"
+
+          if [[ "$DEPLOYMENT_COUNT" -eq 0 ]]; then
+            echo "No real-time deployments exist."
+          else
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                ["DEPLOYMENT", "STATE", "INSTANCE TYPE", "TRAFFIC"],
+                (
+                  $deployments[]
+                  | [
+                      .name,
+                      .state,
+                      .instanceType,
+                      "\($traffic[.name] // 0)%"
+                    ]
+                )
+                | @tsv
+              ' |
+              column -t -s $'\t'
+          fi
+
+          echo "::endgroup::"
+
+          
+          # Explicitly declare the variables as arrays. This prevents
+          # unbound-variable errors when no deployments match.
+          NO_TRAFFIC_DEPLOYMENTS=()
+          DELETED_DEPLOYMENTS=()
+          SKIPPED_DEPLOYMENTS=()
+
+          mapfile -t NO_TRAFFIC_DEPLOYMENTS < <(
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                $deployments[]
+                | select(($traffic[.name] // 0) == 0)
+                | select(
+                    .state == "Succeeded" or
+                    .state == "Failed"
+                  )
+                | .name
+              '
+          )
+
+          mapfile -t SKIPPED_DEPLOYMENTS < <(
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                $deployments[]
+                | select(($traffic[.name] // 0) == 0)
+                | select(
+                    .state != "Succeeded" and
+                    .state != "Failed"
+                  )
+                | "\(.name) (\(.state))"
+              '
+          )
+
+          NO_TRAFFIC_COUNT="${#NO_TRAFFIC_DEPLOYMENTS[@]}"
+          SKIPPED_COUNT="${#SKIPPED_DEPLOYMENTS[@]}"
+
+          echo "::group::Real-time deployment cleanup plan"
+          echo "Eligible for deletion: $NO_TRAFFIC_COUNT"
+          echo "Skipped:               $SKIPPED_COUNT"
+
+          if [[ "$NO_TRAFFIC_COUNT" -eq 0 ]]; then
+            echo "No zero-traffic deployments are eligible for deletion."
+          else
+            echo
+            echo "Deployments to delete:"
+            printf '%s\n' "${NO_TRAFFIC_DEPLOYMENTS[@]}"
+          fi
+
+          if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+            echo
+            echo "Deployments skipped because of their state:"
+            printf '%s\n' "${SKIPPED_DEPLOYMENTS[@]}"
+          fi
+
+          echo "::endgroup::"
+
+          for DEPLOYMENT_NAME in "${NO_TRAFFIC_DEPLOYMENTS[@]}"; do
+            echo "::group::Delete deployment $DEPLOYMENT_NAME"
+
+            az ml online-deployment delete \
+              --name "$DEPLOYMENT_NAME" \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --yes
+
+            DELETED_DEPLOYMENTS+=("$DEPLOYMENT_NAME")
+
+            echo "Deleted deployment: $DEPLOYMENT_NAME"
+            echo "::endgroup::"
+          done
+
+          DELETED_COUNT="${#DELETED_DEPLOYMENTS[@]}"
+
+          REMAINING_DEPLOYMENTS_JSON="$(
+            az ml online-deployment list \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].name' \
+              --output json
+          )"
+
+          REMAINING_COUNT="$(
+            jq 'length' <<< "$REMAINING_DEPLOYMENTS_JSON"
+          )"
+
+          echo "::group::Real-time deployment cleanup result"
+          echo "Deleted deployments:   $DELETED_COUNT"
+          echo "Skipped deployments:   $SKIPPED_COUNT"
+          echo "Remaining deployments: $REMAINING_COUNT"
+
+          if [[ "$REMAINING_COUNT" -gt 0 ]]; then
+            echo
+            echo "Remaining deployments:"
+            jq -r '.[]' <<< "$REMAINING_DEPLOYMENTS_JSON"
+          fi
+
+          echo "::endgroup::"
+
+          {
+            echo "## Real-time deployment cleanup"
+            echo
+            echo "| Result | Count |"
+            echo "|---|---:|"
+            echo "| Deleted | \`$DELETED_COUNT\` |"
+            echo "| Skipped | \`$SKIPPED_COUNT\` |"
+            echo "| Remaining | \`$REMAINING_COUNT\` |"
+            echo
+            echo "### Deleted deployments"
+            echo
+
+            if [[ "$DELETED_COUNT" -eq 0 ]]; then
+              echo "No real-time deployments were deleted."
+            else
+              for DEPLOYMENT_NAME in "${DELETED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT_NAME\`"
+              done
+            fi
+
+            if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+              echo
+              echo "### Skipped deployments"
+              echo
+
+              for DEPLOYMENT in "${SKIPPED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: Delete non-default deployments
+        run: | 
+          set -euo pipefail
+          DEFAULT_DEPLOYMENT=$(az ml batch-endpoint show -g "$RG" -w "$WORKSPACE_NAME" -n "$BATCH_ENDPOINT_NAME" --query "defaults.deployment_name" -o tsv)
+
+          if [[ -z "$DEFAULT_DEPLOYMENT" ||
+            "$DEFAULT_DEPLOYMENT" == "null" ]]; then
+            echo "::error title=Missing default batch deployment::Cleanup stopped to avoid deleting every batch deployment"
+            exit 1
+          fi
+          
+          echo "$DEFAULT_DEPLOYMENT"
+
+          BATCH_DEPLOYMENTS_JSON="$(
+            az ml batch-deployment list \
+              --endpoint-name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].{
+                name:name,
+                state:provisioning_state
+              }' \
+              --output json
+          )"
+          BATCH_DEPLOYMENT_COUNT="$(
+            jq 'length' <<< "$BATCH_DEPLOYMENTS_JSON"
+          )"
+
+          DEPLOYMENTS_TO_DEL=$(az ml batch-deployment list -g "$RG" -w "$WORKSPACE_NAME" -e "$BATCH_ENDPOINT_NAME" --query "[?name!='$DEFAULT_DEPLOYMENT'].[name, provisioning_state]" -o tsv)
+
+          echo "Endpoint:         $BATCH_ENDPOINT_NAME"
+          echo "Default:          $DEFAULT_DEPLOYMENT"
+          echo "Deployment count: $BATCH_DEPLOYMENT_COUNT"
+          echo
+          echo "Current deployments: $BATCH_DEPLOYMENTS_JSON"
+          echo "Delployments to delete: $DEPLOYMENTS_TO_DEL" 
+          
+          if [[ -z "$DEPLOYMENTS_TO_DEL" ]]; then
+            echo "No non-default deployments found."
+            exit 0
+          fi
+
+          DELETED_COUNT=0
+          DELETED_DEPLOYMENTS=()
+            
+          # Read name and state for each line
+          while read -r DEPLOYMENT_NAME STATE; do
+            echo "Checking $DEPLOYMENT_NAME (state: $STATE)"
+
+            # Optionally skip if still provisioning
+            if [[ "$STATE" != "Succeeded" && "$STATE" != "Failed" ]]; then
+              echo "Skipping $DEPLOYMENT_NAME (state not deletable)."
+              continue
+            fi
+          
+            echo "Deleting deployment: $DEPLOYMENT_NAME"
+            az ml batch-deployment delete \
+              -g "$RG" -w "$WORKSPACE_NAME" -e "$BATCH_ENDPOINT_NAME" \
+              -n "$DEPLOYMENT_NAME" --yes
+          
+            DELETED_DEPLOYMENTS+=("$DEPLOYMENT_NAME")
+            ((DELETED_COUNT+=1))
+
+          done <<< "$DEPLOYMENTS_TO_DEL"
+          
+          REMAINING_DEPLOYMENTS_JSON="$(
+            az ml batch-deployment list \
+              --endpoint-name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].name' \
+              --output json
+          )"
+          REMAINING_COUNT="$(jq 'length' <<< "$REMAINING_DEPLOYMENTS_JSON")"
+
+
+          echo "Finished cleaning up non-default batch deployments." 
+
+          {
+            echo "## Batch deployment cleanup"
+            echo
+            echo "| Result | Count |"
+            echo "|---|---:|"
+            echo "| Deleted | \`$DELETED_COUNT\` |"
+            echo "| Remaining | \`$REMAINING_COUNT\` |"
+            echo
+            echo "### Default deployment"
+            echo
+            echo "- \`$DEFAULT_DEPLOYMENT\`"
+            echo
+            echo "### Deleted deployments"
+            echo
+            if [[ "$DELETED_COUNT" -eq 0 ]]; then
+              echo "No batch deployments were deleted."
+            else
+              for DEPLOYMENT_NAME in "${DELETED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT_NAME\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

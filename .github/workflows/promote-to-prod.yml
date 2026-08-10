@@ -1,0 +1,1819 @@
+####
+# Promotes the data and model to the production workpace
+####
+name: Walmart Promote to Production
+on:
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+  MPLBACKEND: Agg
+  RG: "${{ vars.PROD_PREFIX }}-rg"
+  WORKSPACE_NAME: "${{ vars.PROD_PREFIX }}_workspace"
+  ENDPOINT_ENVIRONMENT: "${{ vars.PROD_PREFIX }}-endpoint-env:${{ vars.PROD_ENDPOINT_ENV_VERSION }}"
+  RT_ENDPOINT_PREFIX: "rt-walmart-sales-"
+  BATCH_ENDPOINT_PREFIX: "batch-walmart-sales"
+  MODEL_NAME: "walmart-xgb"
+  TEST_DATA: "test_data"
+  FEATURE_DATA_ASSET_NAME: "walmart_materialized_features"
+  PROMOTED_DATA_VERSION: "${{ vars.PROMOTED_DATA_VERSION }}"
+  PROMOTED_MODEL_VERSION: "${{ vars.PROMOTED_MODEL_VERSION }}"
+
+  # --- Test workspace where the data is produced ---
+  TEST_RG: "${{ vars.TEST_PREFIX }}-rg"
+  TEST_WORKSPACE_NAME: "${{ vars.TEST_PREFIX }}_workspace" 
+
+  ARTIFACT_RETENTION_DAYS: 30
+
+jobs:
+  check-model-version:
+    name: Check if the promoted model version exists in production
+    runs-on: ubuntu-latest
+    outputs:
+      model-version-exists: ${{ steps.check-model-version.outputs.model-version-exists }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Ensure az ml extension is installed
+        run: |
+          set -euo pipefail
+          az extension add -n ml -y || az extension update -n ml -y
+
+      - name: Check promoted model version
+        id: check-model-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az ml model show \
+            --name "$MODEL_NAME" \
+            --version "$PROMOTED_MODEL_VERSION" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --only-show-errors \
+            >/dev/null 2>&1; then
+
+            echo "model-version-exists=true" >> "$GITHUB_OUTPUT"
+            echo "Model exists: ${MODEL_NAME}:${PROMOTED_MODEL_VERSION}"
+          else
+            echo "model-version-exists=false" >> "$GITHUB_OUTPUT"
+            echo "Model does not exist: ${MODEL_NAME}:${PROMOTED_MODEL_VERSION}"
+          fi
+
+      - name: Model check summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODEL_VERSION_EXISTS="${{ steps.check-model-version.outputs.model-version-exists }}"
+
+          {
+            echo "## Production Model Version Check"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Model | \`${MODEL_NAME}\` |"
+            echo "| Version | \`${PROMOTED_MODEL_VERSION}\` |"
+            echo "| Workspace | \`${WORKSPACE_NAME}\` |"
+            echo "| Resource group | \`${RG}\` |"
+            echo "| Model exists | \`${MODEL_VERSION_EXISTS}\` |"
+            echo
+
+            if [[ "$MODEL_VERSION_EXISTS" == "true" ]]; then
+              echo "Model \`${MODEL_NAME}:${PROMOTED_MODEL_VERSION}\` already exists in production."
+            else
+              echo "Model \`${MODEL_NAME}:${PROMOTED_MODEL_VERSION}\` does not exist in production."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+  download-model:
+    name: Download model from test workspace
+    runs-on: ubuntu-latest
+    needs: check-model-version
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.check-model-version.outputs.model-version-exists == 'false'}}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Ensure az ml extension is installed
+        run: |
+          set -euo pipefail
+          az extension add -n ml -y || az extension update -n ml -y
+
+      - name: Download model from test workspace
+        run: |
+          set -euo pipefail
+          LOCAL_FILE="./downloaded-model/model"  
+          mkdir -p "$(dirname "$LOCAL_FILE")"
+          
+          az ml model download \
+            --name "$MODEL_NAME" \
+            --version "$PROMOTED_MODEL_VERSION" \
+            --resource-group "$TEST_RG" \
+            --workspace-name "$TEST_WORKSPACE_NAME" \
+            --download-path "$LOCAL_FILE" \
+            --only-show-errors
+
+          MODEL_FILE="./downloaded-model/model/walmart-xgb/model/model.xgb"
+          MODEL_SIZE="$(du -h "$MODEL_FILE" | cut -f1)"
+          echo "MODEL_SIZE=$MODEL_SIZE" >> "$GITHUB_ENV"
+
+          echo "Model file: $MODEL_FILE"
+          echo "Model size: $MODEL_SIZE"
+          echo
+          echo "Downloaded files:"
+          find "$LOCAL_FILE" -type f -exec ls -lh {} \;
+
+          test -s "$MODEL_FILE" || {
+            echo "::error title=Download failed::The downloaded feature data file is missing or empty."
+            exit 1
+          }
+
+          ls -lh "$LOCAL_FILE"
+
+          {
+            echo "## Model download"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Source workspace | \`$TEST_WORKSPACE_NAME\` |"
+            echo "| Model | \`$MODEL_NAME\` |"
+            echo "| Version | \`$PROMOTED_MODEL_VERSION\` |"
+            echo "| Model file | \`$MODEL_FILE\` |"
+            echo "| Size | $MODEL_SIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model_artifact
+          path: ./downloaded-model/model
+          if-no-files-found: error
+  upload-model:
+    name: Upload model to production
+    runs-on: ubuntu-latest
+    needs: download-model
+    if: ${{ success() && github.ref == 'refs/heads/main'}}
+    steps:
+      - name: Download artifacts from test job
+        uses: actions/download-artifact@v4
+        with:
+          name: model_artifact
+
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Ensure Azure ML extension is installed
+        run: |
+          set -euo pipefail
+          az extension add \
+            --name ml \
+            --upgrade \
+            --yes
+
+      - name: Upload model to production workspace
+        run: |
+          set -euo pipefail
+          MODEL_PATH="./walmart-xgb/model/model.xgb"
+          echo "Model path: $MODEL_PATH"
+
+          if [[ ! -s "$MODEL_PATH" ]]; then
+            echo "::error title=Missing model::Model file not found or empty: $MODEL_PATH"
+            find . -maxdepth 5 -type f -print
+            exit 1
+          fi
+
+          echo "Registering model in production workspace: $RG / $WORKSPACE_NAME"
+          echo "Model path: $MODEL_PATH"
+          MODEL_SIZE="$(du -h "$MODEL_PATH" | cut -f1)"
+          echo "MODEL_SIZE=$MODEL_SIZE" >> "$GITHUB_ENV"
+
+          echo "Model size: $MODEL_SIZE"
+
+          MODEL_JSON="$(
+            az ml model create \
+              --name "$MODEL_NAME" \
+              --version "$PROMOTED_MODEL_VERSION" \
+              --path "$MODEL_PATH" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json
+          )"
+
+          NEW_VERSION=$(echo "$MODEL_JSON" | jq -r '.version')
+          echo "Model registered in PROD as version: $NEW_VERSION"
+          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
+
+          # Validate that Azure ML returned the expected version
+          if [[ "$NEW_VERSION" != "$PROMOTED_MODEL_VERSION" ]]; then
+              echo "ERROR: Azure ML returned version '$NEW_VERSION' but expected '$PROMOTED_MODEL_VERSION'"
+              echo "This means the model upload did not use the correct version."
+              exit 1
+          fi
+      - name: Verify model uploaded successfully
+        run: |
+          REGISTERED_MODEL_JSON="$(
+            az ml model show \
+              --name "$MODEL_NAME" \
+              --version "$PROMOTED_MODEL_VERSION" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json \
+              --only-show-errors
+          )"
+
+          REGISTERED_VERSION="$(
+            jq -r '.version // empty' <<< "$REGISTERED_MODEL_JSON"
+          )"
+
+          if [[ -z "$REGISTERED_VERSION" ]]; then
+            echo "::error title=Model verification failed::Unable to retrieve ${MODEL_NAME}:${PROMOTED_MODEL_VERSION} from production"
+            exit 1
+          fi
+
+          if [[ "$REGISTERED_VERSION" != "$PROMOTED_MODEL_VERSION" ]]; then
+            echo "::error title=Model verification failed::Retrieved version '$REGISTERED_VERSION', expected '$PROMOTED_MODEL_VERSION'"
+            exit 1
+          fi
+
+          {
+            echo "## Production model upload"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Resource group | \`$RG\` |"
+            echo "| Workspace | \`$WORKSPACE_NAME\` |"
+            echo "| Model | \`$MODEL_NAME\` |"
+            echo "| Version | \`$NEW_VERSION\` |"
+            echo "| Model size | $MODEL_SIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+  check-data-version:
+    name: Check if the promoted data version exists in production
+    runs-on: ubuntu-latest
+    outputs:
+      feature-data-version-exists: ${{ steps.check-feature-data-version.outputs.feature-data-version-exists }}
+      test-data-version-exists: ${{ steps.check-test-data-version.outputs.test-data-version-exists }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Ensure az ml extension is installed
+        run: |
+          set -euo pipefail
+          az extension add -n ml -y || az extension update -n ml -y
+      
+      - name: Check promoted feature data version
+        id: check-feature-data-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az ml data show \
+            --name "$FEATURE_DATA_ASSET_NAME" \
+            --version "$PROMOTED_DATA_VERSION" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --only-show-errors \
+            >/dev/null 2>&1; then
+
+            echo "feature-data-version-exists=true" >> "$GITHUB_OUTPUT"
+            echo "Data asset exists: ${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION}"
+          else
+            echo "feature-data-version-exists=false" >> "$GITHUB_OUTPUT"
+            echo "Data asset does not exist: ${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION}"
+          fi
+
+      - name: Check promoted test data version
+        id: check-test-data-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az ml data show \
+            --name "$TEST_DATA" \
+            --version "$PROMOTED_DATA_VERSION" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --only-show-errors \
+            >/dev/null 2>&1; then
+
+            echo "test-data-version-exists=true" >> "$GITHUB_OUTPUT"
+            echo "Data asset exists: ${TEST_DATA}:${PROMOTED_DATA_VERSION}"
+          else
+            echo "test-data-version-exists=false" >> "$GITHUB_OUTPUT"
+            echo "Data asset does not exist: ${TEST_DATA}:${PROMOTED_DATA_VERSION}"
+          fi
+      - name: Create data version summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          FEATURE_DATA_EXISTS: ${{ steps.check-feature-data-version.outputs.feature-data-version-exists }}
+          TEST_DATA_EXISTS: ${{ steps.check-test-data-version.outputs.test-data-version-exists }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Production data version check"
+            echo
+            echo "| Data asset | Version | Exists |"
+            echo "|---|---|---|"
+            echo "| \`$FEATURE_DATA_ASSET_NAME\` | \`$PROMOTED_DATA_VERSION\` | **${FEATURE_DATA_EXISTS:-unknown}** |"
+            echo "| \`$TEST_DATA\` | \`$PROMOTED_DATA_VERSION\` | **${TEST_DATA_EXISTS:-unknown}** |"
+            echo
+            echo "Workspace: \`$WORKSPACE_NAME\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+  download-feature-data:
+    name: Download feature data from test workspace
+    runs-on: ubuntu-latest
+    needs: check-data-version
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    outputs:
+      latest-processed-date: ${{ steps.set-end-date.outputs.latestdate }}
+    env:
+      LOCAL_FILE: "./downloaded-feature-data/walmart_materialized_features_all_weeks.csv"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Ensure az ml extension is installed
+        run: |
+          set -euo pipefail
+          az extension add -n ml -y || az extension update -n ml -y
+
+      - name: Download feature data from test workspace
+        run: |
+          set -euo pipefail
+
+
+          echo "::group::Resolve backing datastore"
+          FEATURE_DATA_PATH="$(az ml data show \
+            --name "$FEATURE_DATA_ASSET_NAME" \
+            --version "$PROMOTED_DATA_VERSION" \
+            --resource-group "$TEST_RG" \
+            --workspace-name "$TEST_WORKSPACE_NAME" \
+            --query path --output tsv
+          )"
+
+          if [[ -z "$FEATURE_DATA_PATH" || "$FEATURE_DATA_PATH" == "null" ]]; then
+            echo "::error title=Missing feature data path::Could not resolve the feature data asset path."
+            exit 1
+          fi
+
+          DATASTORE_NAME="workspaceblobstore"
+          BLOB_NAME="${FEATURE_DATA_PATH#*/paths/}"
+          
+
+          STORAGE_ACCOUNT_NAME="$(
+            az ml datastore show \
+              --name "$DATASTORE_NAME" \
+              --resource-group "$TEST_RG" \
+              --workspace-name "$TEST_WORKSPACE_NAME" \
+              --query account_name \
+              --output tsv
+          )"
+
+          CONTAINER_NAME="$(
+            az ml datastore show \
+              --name "$DATASTORE_NAME" \
+              --resource-group "$TEST_RG" \
+              --workspace-name "$TEST_WORKSPACE_NAME" \
+              --query container_name \
+              --output tsv
+          )"
+
+          if [[ -z "$STORAGE_ACCOUNT_NAME" || "$STORAGE_ACCOUNT_NAME" == "null" ]]; then
+            echo "::error title=Missing storage account::Could not resolve the datastore storage account."
+            exit 1
+          fi
+
+          if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == "null" ]]; then
+            echo "::error title=Missing container::Could not resolve the datastore container."
+            exit 1
+          fi
+
+          echo "Storage account: $STORAGE_ACCOUNT_NAME"
+          echo "Container: $CONTAINER_NAME"
+          echo "Blob: $BLOB_NAME"
+
+          echo "::endgroup::"
+
+          echo "::group::Download feature data"
+          mkdir -p "$(dirname "$LOCAL_FILE")"
+
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT_NAME" \
+            --container-name "$CONTAINER_NAME" \
+            --name "$BLOB_NAME" \
+            --file "$LOCAL_FILE" \
+            --overwrite true \
+            --only-show-errors
+
+          echo "::endgroup::"
+          
+          echo "::group::Validate downloaded feature data"
+          test -s "$LOCAL_FILE" || {
+            echo "::error title=Download failed::The downloaded feature data file is missing or empty."
+            exit 1
+          }
+
+          ls -lh "$LOCAL_FILE"
+
+          FILE_SIZE="$(du -h "$LOCAL_FILE" | cut -f1)"
+          TOTAL_LINES="$(wc -l < "$LOCAL_FILE")"
+          DATA_ROW_COUNT=$((TOTAL_LINES - 1))
+
+          if (( DATA_ROW_COUNT <= 0 )); then
+            echo "::error title=Empty feature data::The downloaded CSV contains no data rows"
+            exit 1
+          fi
+
+          {
+            echo "FEATURE_DATA_FILE_SIZE=$FILE_SIZE"
+            echo "FEATURE_DATA_ROW_COUNT=$DATA_ROW_COUNT"
+            echo "FEATURE_DATA_SOURCE_PATH=$FEATURE_DATA_PATH"
+          } >> "$GITHUB_ENV"
+
+          echo "File:      $LOCAL_FILE"
+          echo "Size:      $FILE_SIZE"
+          echo "Data rows: $DATA_ROW_COUNT"
+          echo "Validation passed"
+          echo "::endgroup::"
+      
+      - name: Get end date from uploaded feature data
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          python3 src/pipeline_scripts/get_latest_date_csv.py --file $LOCAL_FILE --github_env
+
+      - name: Display uploaded file end date
+        shell: bash
+        id: set-end-date
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${LATEST_DATE:-}" ]]; then
+            echo "::error title=Missing latest date::LATEST_DATE was not populated from the feature data"
+            exit 1
+          fi
+
+          if [[ -z "${MATERIALISATION_END_DATE:-}" ]]; then
+            echo "::error title=Missing materialisation end date::MATERIALISATION_END_DATE was not populated"
+            exit 1
+          fi
+
+          echo "Latest CSV date:     $LATEST_DATE"
+          echo "Required materialisation end date:  $MATERIALISATION_END_DATE"
+
+          echo "latestdate=$LATEST_DATE" >> "$GITHUB_OUTPUT"
+          echo "end-date=$MATERIALISATION_END_DATE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Feature data download"
+            echo
+            echo "### Downloaded file"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| File | \`$LOCAL_FILE\` |"
+            echo "| File size | \`${FEATURE_DATA_FILE_SIZE:-unknown}\` |"
+            echo "| Data rows | \`${FEATURE_DATA_ROW_COUNT:-unknown}\` |"
+            echo
+            echo "### Date range"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Latest CSV date | \`$LATEST_DATE\` |"
+            echo "| Materialisation end date | \`$MATERIALISATION_END_DATE\` |"
+            echo
+            echo "Feature data is ready to be uploaded to the production workspace."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: Upload feature data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature_data_artifact
+          path: ./downloaded-feature-data/walmart_materialized_features_all_weeks.csv
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  download-test-data:
+    name: Download test data from test workspace
+    runs-on: ubuntu-latest
+    needs: check-data-version
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.check-data-version.outputs.test-data-version-exists == 'false'}}
+    steps:
+      
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Ensure az ml extension is installed
+        run: |
+          set -euo pipefail
+          az extension add -n ml -y || az extension update -n ml -y
+      
+      - name: Download test data from test workspace
+        run: |
+          set -euo pipefail
+
+          echo "::group::Resolve test data asset"
+          TEST_DATA_PATH="$(az ml data show \
+            --name "$TEST_DATA" \
+            --version "$PROMOTED_DATA_VERSION" \
+            --resource-group "$TEST_RG" \
+            --workspace-name "$TEST_WORKSPACE_NAME" \
+            --query path --output tsv
+          )"
+
+          if [[ -z "$TEST_DATA_PATH" || "$TEST_DATA_PATH" == "null" ]]; then
+            echo "::error title=Missing test data path::Could not resolve the path for ${TEST_DATA}:${PROMOTED_DATA_VERSION}"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Resolve backing datastore"
+          DATASTORE_NAME="workspaceblobstore"
+          BLOB_NAME="${TEST_DATA_PATH#*/paths/}"
+          LOCAL_FILE="./downloaded-test-data/test_data.csv"
+
+          STORAGE_ACCOUNT_NAME="$(
+            az ml datastore show \
+              --name "$DATASTORE_NAME" \
+              --resource-group "$TEST_RG" \
+              --workspace-name "$TEST_WORKSPACE_NAME" \
+              --query account_name \
+              --output tsv
+          )"
+
+          CONTAINER_NAME="$(
+            az ml datastore show \
+              --name "$DATASTORE_NAME" \
+              --resource-group "$TEST_RG" \
+              --workspace-name "$TEST_WORKSPACE_NAME" \
+              --query container_name \
+              --output tsv
+          )"
+
+          if [[ -z "$STORAGE_ACCOUNT_NAME" || "$STORAGE_ACCOUNT_NAME" == "null" ]]; then
+            echo "::error title=Missing storage account::Could not resolve the datastore storage account."
+            exit 1
+          fi
+
+          if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == "null" ]]; then
+            echo "::error title=Missing container::Could not resolve the datastore container."
+            exit 1
+          fi
+
+          echo "Datastore:       $DATASTORE_NAME"
+          echo "Storage account: $STORAGE_ACCOUNT_NAME"
+          echo "Container: $CONTAINER_NAME"
+          echo "Blob: $BLOB_NAME"
+          echo "::endgroup::"
+
+          echo "::group::Download test data"
+          mkdir -p "$(dirname "$LOCAL_FILE")"
+
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT_NAME" \
+            --container-name "$CONTAINER_NAME" \
+            --name "$BLOB_NAME" \
+            --file "$LOCAL_FILE" \
+            --overwrite true \
+            --only-show-errors
+           echo "::endgroup::"
+
+          echo "::group::Validate downloaded test data"
+          test -s "$LOCAL_FILE" || {
+            echo "::error title=Download failed::The downloaded test data file is missing or empty."
+            exit 1
+          }
+
+          ls -lh "$LOCAL_FILE"
+
+          FILE_SIZE="$(du -h "$LOCAL_FILE" | cut -f1)"
+          TOTAL_LINES="$(wc -l < "$LOCAL_FILE")"
+
+          # CSV contains a header.
+          if (( TOTAL_LINES > 0 )); then
+            ROW_COUNT=$((TOTAL_LINES - 1))
+          else
+            ROW_COUNT=0
+          fi
+
+          echo "File:      $LOCAL_FILE"
+          echo "Size:      $FILE_SIZE"
+          echo "Data rows: $ROW_COUNT"
+
+          if (( ROW_COUNT == 0 )); then
+            echo "::error title=Empty test dataset::The downloaded CSV contains no data rows"
+            exit 1
+          fi
+
+          echo "::endgroup::"
+
+          {
+            echo "## Test data download"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Source workspace | \`$TEST_WORKSPACE_NAME\` |"
+            echo "| Data asset | \`$TEST_DATA\` |"
+            echo "| Version | \`$PROMOTED_DATA_VERSION\` |"
+            echo "| Data rows | $ROW_COUNT |"
+            echo "| Size | $FILE_SIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_data_artifact
+          path: ./downloaded-test-data/test_data.csv
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  upload-feature-data:
+    name: Upload feature data to production
+    runs-on: ubuntu-latest
+    needs: [download-feature-data, check-data-version]
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.check-data-version.outputs.feature-data-version-exists == 'false'}}
+    steps:
+      
+      - name: Download artifacts from test job
+        uses: actions/download-artifact@v4
+        with:
+          name: feature_data_artifact
+
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Ensure Azure ML extension is installed
+        run: |
+          set -euo pipefail
+          az extension add \
+            --name ml \
+            --upgrade \
+            --yes
+
+      - name: Upload feature data to production workspace
+        run: |
+          set -euo pipefail
+
+          FEATURE_DATA_FILE="walmart_materialized_features_all_weeks.csv"
+
+          echo "::group::Validate feature data artifact"
+
+          echo "File: $FEATURE_DATA_FILE"
+
+          if [[ ! -s "$FEATURE_DATA_FILE" ]]; then
+            echo "::error title=Missing feature data::Feature data file not found or empty: $FEATURE_DATA_FILE"
+            echo
+            echo "Available files:"
+            find . -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          FILE_SIZE="$(du -h "$FEATURE_DATA_FILE" | cut -f1)"
+          TOTAL_LINES="$(wc -l < "$FEATURE_DATA_FILE")"
+          ROW_COUNT=$((TOTAL_LINES - 1))
+
+          if (( ROW_COUNT <= 0 )); then
+            echo "::error title=Empty feature data::Feature data contains no data rows"
+            exit 1
+          fi
+
+          echo "Size:      $FILE_SIZE"
+          echo "Data rows: $ROW_COUNT"
+          echo "Artifact validation passed"
+
+          echo "::endgroup::"
+
+          echo "::group::Register feature data in production"
+          DATA_JSON="$(
+            az ml data create \
+              --name "$FEATURE_DATA_ASSET_NAME" \
+              --version "$PROMOTED_DATA_VERSION" \
+              --path "walmart_materialized_features_all_weeks.csv" \
+              --type uri_file \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json
+          )"
+
+          CREATED_VERSION="$(jq -r '.version // empty' <<< "$DATA_JSON")"
+
+          if [[ -z "$CREATED_VERSION" ]]; then
+            echo "::error title=Feature data registration failed::Azure ML did not return a data asset version"
+            exit 1
+          fi
+
+          echo "Created version: $CREATED_VERSION"
+
+          if [[ "$CREATED_VERSION" != "$PROMOTED_DATA_VERSION" ]]; then
+            echo "::error title=Data version mismatch::Azure ML returned version '$CREATED_VERSION', expected '$PROMOTED_DATA_VERSION'"
+            exit 1
+          fi
+
+          echo "::endgroup::"
+
+          echo "::group::Verify feature data in production"
+
+          REGISTERED_DATA_JSON="$(
+            az ml data show \
+              --name "$FEATURE_DATA_ASSET_NAME" \
+              --version "$PROMOTED_DATA_VERSION" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json \
+              --only-show-errors
+          )"
+
+          REGISTERED_VERSION="$(
+            jq -r '.version // empty' <<< "$REGISTERED_DATA_JSON"
+          )"
+
+          REGISTERED_PATH="$(
+            jq -r '.path // empty' <<< "$REGISTERED_DATA_JSON"
+          )"
+
+          if [[ -z "$REGISTERED_VERSION" ]]; then
+            echo "::error title=Feature data verification failed::Unable to retrieve ${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION} from production"
+            exit 1
+          fi
+
+          if [[ "$REGISTERED_VERSION" != "$PROMOTED_DATA_VERSION" ]]; then
+            echo "::error title=Feature data verification failed::Retrieved version '$REGISTERED_VERSION', expected '$PROMOTED_DATA_VERSION'"
+            exit 1
+          fi
+
+          echo "Data asset: $FEATURE_DATA_ASSET_NAME"
+          echo "Version:    $REGISTERED_VERSION"
+          echo "Path:       $REGISTERED_PATH"
+
+          echo "::endgroup::"
+
+          {
+            echo "## Production feature data upload"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Workspace | \`$WORKSPACE_NAME\` |"
+            echo "| Data asset | \`$FEATURE_DATA_ASSET_NAME\` |"
+            echo "| Version | \`$REGISTERED_VERSION\` |"
+            echo "| Type | \`uri_file\` |"
+            echo "| Data rows | $ROW_COUNT |"
+            echo "| File size | $FILE_SIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+  upload-test-data:
+    name: Upload test data to production
+    runs-on: ubuntu-latest
+    needs: [download-test-data, check-data-version]
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.check-data-version.outputs.test-data-version-exists == 'false'}}
+    steps:
+    
+      - name: Download artifacts from test job
+        uses: actions/download-artifact@v4
+        with:
+          name: test_data_artifact
+          
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Ensure Azure ML extension is installed
+        run: |
+          set -euo pipefail
+          az extension add \
+            --name ml \
+            --upgrade \
+            --yes
+
+      - name: Upload test data to production workspace
+        run: |
+          set -euo pipefail
+
+
+          TEST_DATA_FILE="./test_data.csv"
+
+          echo "::group::Validate test data artifact"
+
+          echo "File: $TEST_DATA_FILE"
+
+          if [[ ! -s "$TEST_DATA_FILE" ]]; then
+              echo "::error title=Missing test data::Test data file not found or empty: $TEST_DATA_FILE"
+              echo
+              echo "Available files:"
+              find . -maxdepth 3 -type f -print
+              exit 1
+          fi
+
+          FILE_SIZE="$(du -h "$TEST_DATA_FILE" | cut -f1)"
+          TOTAL_LINES="$(wc -l < "$TEST_DATA_FILE")"
+
+          if (( TOTAL_LINES <= 1 )); then
+              echo "::error title=Empty test data::Test data contains no data rows"
+              exit 1
+          fi
+
+          ROW_COUNT=$((TOTAL_LINES - 1))
+
+          echo "Size:      $FILE_SIZE"
+          echo "Data rows: $ROW_COUNT"
+          echo "Artifact validation passed"
+
+          echo "::endgroup::"
+
+          echo "::group::Register test data in production"
+          DATA_JSON="$(
+            az ml data create \
+              --name "$TEST_DATA" \
+              --version "$PROMOTED_DATA_VERSION" \
+              --path "$TEST_DATA_FILE" \
+              --type uri_file \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json \
+              --only-show-errors
+          )"
+
+          CREATED_VERSION="$(
+            jq -r '.version // empty' <<< "$DATA_JSON"
+          )"
+
+          if [[ -z "$CREATED_VERSION" ]]; then
+            echo "::error title=Test data registration failed::Azure ML did not return a data asset version"
+            exit 1
+          fi
+
+          echo "Expected version: $PROMOTED_DATA_VERSION"
+          echo "Created version:  $CREATED_VERSION"
+
+          if [[ "$CREATED_VERSION" != "$PROMOTED_DATA_VERSION" ]]; then
+            echo "::error title=Data version mismatch::Azure ML returned version '$CREATED_VERSION', expected '$PROMOTED_DATA_VERSION'"
+            exit 1
+          fi
+
+          echo "::endgroup::"
+
+          echo "::group::Verify test data in production"
+
+          REGISTERED_DATA_JSON="$(
+            az ml data show \
+              --name "$TEST_DATA" \
+              --version "$PROMOTED_DATA_VERSION" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json \
+              --only-show-errors
+          )"
+
+          REGISTERED_VERSION="$(
+            jq -r '.version // empty' <<< "$REGISTERED_DATA_JSON"
+          )"
+
+          REGISTERED_PATH="$(
+            jq -r '.path // empty' <<< "$REGISTERED_DATA_JSON"
+          )"
+
+          if [[ -z "$REGISTERED_VERSION" ]]; then
+            echo "::error title=Test data verification failed::Unable to retrieve ${TEST_DATA}:${PROMOTED_DATA_VERSION} from production"
+            exit 1
+          fi
+
+          if [[ "$REGISTERED_VERSION" != "$PROMOTED_DATA_VERSION" ]]; then
+            echo "::error title=Test data verification failed::Retrieved version '$REGISTERED_VERSION', expected '$PROMOTED_DATA_VERSION'"
+            exit 1
+          fi
+
+          echo "Data asset: $TEST_DATA"
+          echo "Version:    $REGISTERED_VERSION"
+          echo "Path:       $REGISTERED_PATH"
+
+          echo "::endgroup::"
+
+          {
+            echo "## Production test data upload"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Resource group | \`$RG\` |"
+            echo "| Workspace | \`$WORKSPACE_NAME\` |"
+            echo "| Data asset | \`$TEST_DATA\` |"
+            echo "| Version | \`$REGISTERED_VERSION\` |"
+            echo "| Type | \`uri_file\` |"
+            echo "| Data rows | \`$ROW_COUNT\` |"
+            echo "| File size | \`$FILE_SIZE\` |"
+            echo "| Registered path | \`$REGISTERED_PATH\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+  update-rt-endpoint:
+    name: Update real-time endpoint to production
+    runs-on: ubuntu-latest
+    needs: [upload-model, upload-feature-data, upload-test-data, download-feature-data]
+    if: ${{ always() && !failure() && !cancelled() && github.ref == 'refs/heads/main' }}
+    env:
+      RT_DEPLOYMENT_YAML: azureml/rt-deployment.yaml
+      LATEST_PROCESSED_DATE: ${{ needs.download-feature-data.outputs.latest-processed-date }}
+    outputs:
+      rt_endpoint_name: ${{ steps.get-rt-endpoint.outputs.rt_endpoint_name }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+      - uses: actions/checkout@v6
+      - name: Ensure Azure ML extension is installed
+        run: |
+          set -euo pipefail
+          az extension add \
+            --name ml \
+            --upgrade \
+            --yes
+
+      - name: Query real-time endpoint name
+        id: get-rt-endpoint
+        run: |
+          set -euo pipefail
+          ENDPOINT_NAME="${RT_ENDPOINT_PREFIX}${PROMOTED_MODEL_VERSION}"
+          echo "Updating real-time endpoint in PROD workspace: $RG / $WORKSPACE_NAME"
+
+          RT_ENDPOINT_NAME="$(
+              az ml online-endpoint list \
+                  --resource-group "$RG" \
+                  --workspace-name "$WORKSPACE_NAME" \
+                  --query "[?starts_with(name, '${RT_ENDPOINT_PREFIX}')].name | [0]" \
+                  --output tsv
+          )"
+
+          if [[ -n "$RT_ENDPOINT_NAME" ]]; then
+              echo "Existing realtime endpoint found: '$RT_ENDPOINT_NAME'"
+              echo "rt_endpoint_name=$RT_ENDPOINT_NAME" >> "$GITHUB_OUTPUT"
+              echo "RT_ENDPOINT_NAME=$RT_ENDPOINT_NAME" >> "$GITHUB_ENV"
+          else
+              echo "No realtime endpoint beginning with '$RT_ENDPOINT_PREFIX' exists."
+              exit 1
+          fi
+      
+      - name: Create deployment
+        id: create-rt-endpoint-deployment
+        run: |
+          set -euo pipefail
+          timestamp=$(date -u +'%Y%m%d-%H%M%S')
+          RT_DEPLOYMENT_NAME="rt-deployment-$timestamp"
+          echo "rt_deployment_name=$RT_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+          echo "RT_DEPLOYMENT_NAME=$RT_DEPLOYMENT_NAME" >> "$GITHUB_ENV"
+
+
+          #INSTANCE_TYPE="Standard_DS3_v2"
+          #INSTANCE_TYPE="Standard_DS2_v2"
+          INSTANCE_TYPE="Standard_F4s_v2"
+
+          echo "::group::Resolve deployment configuration"
+          SUBSCRIPTION_ID="$(
+            az account show \
+              --query id \
+              --output tsv
+          )"
+
+           if [[ -z "$SUBSCRIPTION_ID" ]]; then
+            echo "::error::Could not determine the Azure subscription ID."
+            exit 1
+          fi
+
+          echo "::endgroup::" 
+          echo "::group::Generate deployment YAML"
+
+          MODEL_VERSION=$PROMOTED_MODEL_VERSION
+          FEATURE_DATA_ASSET_VERSION=$PROMOTED_DATA_VERSION
+          echo "Real-time deployment: $RT_DEPLOYMENT_NAME"
+          echo "Instance type: $INSTANCE_TYPE"
+          echo "Model: ${MODEL_NAME}:${MODEL_VERSION}"
+          echo "Feature data: ${FEATURE_DATA_ASSET_NAME}:${FEATURE_DATA_ASSET_VERSION}"
+          
+          echo "RT_DEPLOYMENT_NAME=$RT_DEPLOYMENT_NAME" >> $GITHUB_ENV
+          echo "rt_deployment_name=$RT_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+
+          CURRENT_DEPLOYMENT_TYPES=$(az ml online-deployment list --endpoint-name "$RT_ENDPOINT_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --query "[].instance_type" -o tsv)
+
+          
+          SCORE_SCRIPT="walmart_realtime_score.py"
+
+          export MODEL_VERSION SUBSCRIPTION_ID FEATURE_DATA_ASSET_NAME FEATURE_DATA_ASSET_VERSION RT_DEPLOYMENT_NAME INSTANCE_TYPE SCORE_SCRIPT
+          envsubst \
+            '${INSTANCE_TYPE}
+            ${RT_DEPLOYMENT_NAME}
+            ${RT_ENDPOINT_NAME}
+            ${MODEL_NAME}
+            ${MODEL_VERSION}
+            ${ENDPOINT_ENVIRONMENT}
+            ${SUBSCRIPTION_ID}
+            ${RG}
+            ${WORKSPACE_NAME}
+            ${FEATURE_DATA_ASSET_NAME}
+            ${FEATURE_DATA_ASSET_VERSION}
+            ${SCORE_SCRIPT}' \
+            < azureml/rt-deployment-template.yaml \
+            > "$RT_DEPLOYMENT_YAML"
+
+          if [[ ! -s "$RT_DEPLOYMENT_YAML" ]]; then
+            echo "::error::Deployment YAML was not generated."
+            exit 1
+          fi
+
+          echo "Generated deployment YAML:"
+          cat "$RT_DEPLOYMENT_YAML"
+          echo "::endgroup::" 
+          
+          echo "::group::Create real-time deployment"
+          RT_DEPLOYMENT_JSON=$(az ml online-deployment create --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --file "$RT_DEPLOYMENT_YAML" --output json)
+          echo "$RT_DEPLOYMENT_JSON"
+          RT_DEPLOYMENT_STATE=$(az ml online-deployment show --name "$RT_DEPLOYMENT_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --endpoint-name "$RT_ENDPOINT_NAME" --query "provisioning_state" -o tsv)
+          echo "$RT_DEPLOYMENT_STATE"
+          
+          if [[ "$RT_DEPLOYMENT_STATE" == "Succeeded" ]]; then
+              echo "Deployment '$RT_DEPLOYMENT_NAME' created successfully in endpoint '$RT_ENDPOINT_NAME'"
+          else
+              echo "Failed to create deployment '$RT_DEPLOYMENT_NAME' (provisioningState: $RT_DEPLOYMENT_STATE)"
+              az ml online-deployment get-logs \
+                --name "$RT_DEPLOYMENT_NAME" \
+                --endpoint-name "$RT_ENDPOINT_NAME" \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --lines 200 || true
+              exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Test real-time endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUEST_FILE="${RUNNER_TEMP}/walmart-endpoint-request.json"
+          RESPONSE_FILE="${RUNNER_TEMP}/walmart-endpoint-response.json"
+          RAW_RESPONSE_FILE="${RUNNER_TEMP}/walmart-endpoint-raw-response.json"
+
+          echo "::group::Prepare smoke-test request"
+          if [[ -z "${LATEST_PROCESSED_DATE:-}" ]]; then
+              echo "::error::LATEST_PROCESSED_DATE is not set"
+              exit 1
+          fi
+
+          REQUEST_DATE="$LATEST_PROCESSED_DATE"
+
+          jq -n \
+              --arg date "$REQUEST_DATE" \
+              '{
+                  input_data: [
+                      {
+                          Store: 1,
+                          Date: $date
+                      }
+                  ]
+              }' > "$REQUEST_FILE"
+
+          echo "Request:"
+          jq . "$REQUEST_FILE"
+          
+          echo "::endgroup::"
+       
+          echo "Calling deployment: $RT_DEPLOYMENT_NAME"
+          
+          echo "::group::Invoke real-time deployment"
+
+
+          if ! az ml online-endpoint invoke \
+            --name "$RT_ENDPOINT_NAME" \
+            --deployment-name "$RT_DEPLOYMENT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --request-file "$REQUEST_FILE" \
+            --output json > "$RAW_RESPONSE_FILE"; then
+
+            echo "::error title=Endpoint invocation failed::Azure CLI could not invoke the deployment."
+
+            az ml online-deployment get-logs \
+              --name "$RT_DEPLOYMENT_NAME" \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --lines 200 || true
+
+            exit 1
+          fi
+
+          if [[ ! -s "$RAW_RESPONSE_FILE" ]]; then
+            echo "::error title=Empty endpoint response::The endpoint returned no content."
+            exit 1
+          fi
+
+          jq -r 'fromjson' "$RAW_RESPONSE_FILE" > "$RESPONSE_FILE"
+
+          echo "Endpoint response:"
+          jq . "$RESPONSE_FILE"
+
+          echo "::endgroup::"
+          
+          echo "::group::Validate scoring response"
+          # 1. Check for API/Model errors
+          if jq -e 'has("error")' "$RESPONSE_FILE" >/dev/null; then
+            ERROR_TYPE="$(jq -r '.error' "$RESPONSE_FILE")"
+            ERROR_MESSAGE="$(jq -r '.message // "No error message returned"' "$RESPONSE_FILE")"
+
+            echo "::error title=Endpoint scoring failed::$ERROR_TYPE: $ERROR_MESSAGE"
+            exit 1
+          fi
+
+
+          # 2. Validate response structure and field presence
+          jq -e \
+            --arg request_date "$REQUEST_DATE" \
+            '
+              (.predictions | type == "array") and
+              (.predictions | length > 0) and
+              (.predictions[0].Store == 1) and
+              (.predictions[0].Feature_Date == $request_date) and
+              (.predictions[0] | has("Prediction_Date")) and
+              (.predictions[0] | has("Predicted_Weekly_Sales")) and
+              (.predictions[0].Predicted_Weekly_Sales != null)
+            ' "$RESPONSE_FILE" >/dev/null || {
+              echo "::error title=Invalid endpoint response::The response structure did not match the expected format."
+              exit 1
+            }
+
+
+          # 3. Extract variables safely
+          STORE="$(jq -r '.predictions[0].Store' "$RESPONSE_FILE")"
+          FEATURE_DATE="$(jq -r '.predictions[0].Feature_Date' "$RESPONSE_FILE")"
+          PREDICTION_DATE="$(jq -r '.predictions[0].Prediction_Date' "$RESPONSE_FILE")"
+          PREDICTED_SALES="$(jq -r '.predictions[0].Predicted_Weekly_Sales' "$RESPONSE_FILE")"
+
+          echo "Endpoint test succeeded."
+          echo "Store: $STORE"
+          echo "Feature date: $FEATURE_DATE"
+          echo "Prediction date: $PREDICTION_DATE"
+          echo "Predicted weekly sales: $PREDICTED_SALES"
+
+          echo "::endgroup::"
+      - name: Current traffic allocation
+        run: |
+         set -euo pipefail 
+         CURRENT_TRAFFIC_JSON="$(
+            az ml online-endpoint show \
+              --name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query traffic \
+              --output json
+          )"
+
+          if [[ "$(jq 'length' <<< "$CURRENT_TRAFFIC_JSON")" -eq 0 ]]; then
+            echo "No deployment currently receives endpoint traffic."
+          else
+            jq -r '
+              ["DEPLOYMENT", "TRAFFIC"],
+              (
+                to_entries[]
+                | [.key, "\(.value)%"]
+              )
+              | @tsv
+            ' <<< "$CURRENT_TRAFFIC_JSON" |
+              column -t -s $'\t'
+          fi
+
+          PREVIOUS_TRAFFIC="$(
+            jq --compact-output '.' <<< "$CURRENT_TRAFFIC_JSON"
+          )"
+          echo "PREVIOUS_TRAFFIC=$PREVIOUS_TRAFFIC" >> $GITHUB_ENV
+      - name: Update traffic
+        run: |
+          set -euo pipefail
+          echo "Endpoint:       $RT_ENDPOINT_NAME"
+          echo "New deployment: $RT_DEPLOYMENT_NAME"
+          echo "Target traffic: 100%"
+          echo "Resource group: $RG"
+          echo "Workspace:      $WORKSPACE_NAME"
+
+
+          RT_TRAFFIC_JSON=$(az ml online-endpoint update -n "$RT_ENDPOINT_NAME" --traffic "$RT_DEPLOYMENT_NAME=100" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME")
+          RT_TRAFFIC_STATE=$(echo "$RT_TRAFFIC_JSON" | jq -r '.provisioning_state')
+
+          if [[ "$RT_TRAFFIC_STATE" == "Succeeded" ]]; then
+              echo "Traffic for deployment '$RT_DEPLOYMENT_NAME' updated successfully in resource group '$RG'"
+          else
+              echo "Failed to update deployment '$RT_DEPLOYMENT_NAME' traffic (provisioningState: $RT_TRAFFIC_STATE)"
+              exit 1
+          fi
+      - name: Create realtime deployment summary
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Realtime endpoint refresh"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`$RT_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$RT_DEPLOYMENT_NAME\` |"
+            echo "| Model | \`${MODEL_NAME}:${PROMOTED_MODEL_VERSION}\` |"
+            echo "| Feature data | \`${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION}\` |"
+            echo "| Test date | \`$LATEST_PROCESSED_DATE\` |"
+            echo "| Traffic | \`100%\` |"
+            echo
+            echo "New realtime deployment created, tested, and promoted to 100% traffic."
+          } >> "$GITHUB_STEP_SUMMARY"
+  update-batch-endpoint:
+    name: Update batch endpoint model to production
+    runs-on: ubuntu-latest
+    needs: [upload-model, upload-feature-data, upload-test-data, download-feature-data]
+    if: ${{ always() && !failure() && !cancelled() && github.ref == 'refs/heads/main' }}
+    env:
+      BATCH_DEPLOYMENT_YAML: azureml/batch-endpoint-deployment.yaml
+      LATEST_PROCESSED_DATE: ${{ needs.download-feature-data.outputs.latest-processed-date }}
+    outputs:
+      batch_endpoint_name: ${{ steps.get-batch-endpoint.outputs.batch_endpoint_name }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+      
+      - name: Verify Azure login
+        run: az account show
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install pandas
+      
+      - name: Ensure Azure ML extension is installed
+        run: |
+          set -euo pipefail
+          az extension add \
+            --name ml \
+            --upgrade \
+            --yes
+      - name: Query batch endpoint name
+        id: get-batch-endpoint
+        run: |
+            set -euo pipefail
+            BATCH_ENDPOINT_NAME="$(
+              az ml batch-endpoint list \
+                --resource-group "$RG" \
+                --workspace-name "$WORKSPACE_NAME" \
+                --query "[?starts_with(name, '${BATCH_ENDPOINT_PREFIX}')].name | [0]" \
+                --output tsv
+            )"
+
+            if [[ -z "$BATCH_ENDPOINT_NAME" || "$BATCH_ENDPOINT_NAME" == "null" ]]; then
+              echo "::error title=Batch endpoint not found::No batch endpoint beginning with '$BATCH_ENDPOINT_PREFIX' was found."
+              exit 1
+            fi
+
+            echo "Batch endpoint found: $BATCH_ENDPOINT_NAME"
+            echo "batch_endpoint_name=$BATCH_ENDPOINT_NAME" >> "$GITHUB_OUTPUT"
+            echo "BATCH_ENDPOINT_NAME=$BATCH_ENDPOINT_NAME" >> "$GITHUB_ENV"
+      
+      - name: Create deployment
+        id: create_batch_deployment
+        run: |
+          set -euo pipefail
+          TIMESTAMP="$(date -u +'%Y%m%d-%H%M%S')"
+          BATCH_DEPLOYMENT_NAME="batch-deployment-$TIMESTAMP"
+          BATCH_DEPLOYMENT_DESC="XGBoost walmart sales batch deployment"
+          COMPUTE_NAME="${{ vars.PROD_PREFIX }}-compute"
+          SCORE_SCRIPT="walmart_batch_score.py"
+          echo "BATCH_DEPLOYMENT_NAME=$BATCH_DEPLOYMENT_NAME" >> $GITHUB_ENV
+          echo "batch_deployment_name=$BATCH_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+
+          FEATURE_DATA_ASSET_VERSION=$PROMOTED_DATA_VERSION
+          MODEL_VERSION=$PROMOTED_MODEL_VERSION
+
+          echo "::group::Resolve and verify Azure resources"
+          SUBSCRIPTION_ID="$(
+            az account show \
+              --query id \
+              --output tsv
+          )"
+
+          if [[ -z "$SUBSCRIPTION_ID" ]]; then
+            echo "::error::Could not determine the Azure subscription ID."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Render batch deployment YAML"
+
+          export BATCH_DEPLOYMENT_NAME BATCH_DEPLOYMENT_DESC COMPUTE_NAME SCORE_SCRIPT SUBSCRIPTION_ID FEATURE_DATA_ASSET_VERSION MODEL_VERSION      
+          envsubst '${BATCH_DEPLOYMENT_NAME} ${BATCH_DEPLOYMENT_DESC} ${BATCH_ENDPOINT_NAME} ${MODEL_NAME} ${MODEL_VERSION} ${COMPUTE_NAME} ${ENDPOINT_ENVIRONMENT} ${SUBSCRIPTION_ID} ${RG} ${WORKSPACE_NAME} ${FEATURE_DATA_ASSET_NAME} ${FEATURE_DATA_ASSET_VERSION} ${SCORE_SCRIPT}' < azureml/batch-deployment-template.yaml > $BATCH_DEPLOYMENT_YAML
+
+          if [[ ! -f "$BATCH_DEPLOYMENT_YAML" ]]; then
+            echo "::error title=Missing file::Batch endpoint deployment YAML not found at: $BATCH_DEPLOYMENT_YAML"
+            exit 1
+          fi
+          
+          cat $BATCH_DEPLOYMENT_YAML
+          echo "::endgroup::"
+
+          echo "::group::Create Azure ML batch deployment"
+          # --set-default # causes breakage
+          BATCH_DEPLOYMENT_JSON=$(az ml batch-deployment create --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --file "$BATCH_DEPLOYMENT_YAML")
+          
+          BATCH_DEPLOYMENT_STATE=$(echo "$BATCH_DEPLOYMENT_JSON" | jq -r '.provisioning_state')
+          
+          if [[ "$BATCH_DEPLOYMENT_STATE" == "Succeeded" ]]; then
+              echo "Batch deployment '$BATCH_DEPLOYMENT_NAME' created successfully in resource group '$RG'"
+          else
+              echo "Failed to create batch deployment '$BATCH_DEPLOYMENT_NAME' (provisioningState: $BATCH_DEPLOYMENT_STATE)"
+              exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Run batch endpoint job
+        run: |
+          set -euo pipefail
+          TEST_DATA_ASSET="azureml:test_data:${PROMOTED_DATA_VERSION}"
+
+          echo "Using batch input: $TEST_DATA_ASSET"
+          echo "::group::Invoke batch endpoint"
+          BATCH_JOB=$(
+            az ml batch-endpoint invoke \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --deployment-name "$BATCH_DEPLOYMENT_NAME" \
+              --input "$TEST_DATA_ASSET" \
+              --input-type uri_file \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME"
+          )
+          echo "$BATCH_JOB"
+          BATCH_JOB_NAME=$(echo "$BATCH_JOB" | jq -r '.name')
+          az ml job stream -n "$BATCH_JOB_NAME" --resource-group "$RG" --workspace-name "$WORKSPACE_NAME"
+
+          BATCH_JOB_STATUS="$(
+            az ml job show \
+              --name "$BATCH_JOB_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query status \
+              --output tsv
+          )"
+
+          if [[ "$BATCH_JOB_STATUS" != "Completed" ]]; then
+            echo "::error title=Batch job failed::$BATCH_JOB_NAME finished with status '$BATCH_JOB_STATUS'"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "Batch job $BATCH_JOB_NAME completed successfully."
+          echo "BATCH_JOB_NAME=$BATCH_JOB_NAME" >> $GITHUB_ENV
+
+      
+
+      - name: Validate batch job output
+        id: validate_batch_output
+        run: |
+            set -euo pipefail
+
+            echo "::group::Download batch predictions"
+            PREDICTIONS_FILE="batch-results/predictions.csv"
+
+            az ml job download \
+              --name "$BATCH_JOB_NAME" \
+              --output-name score \
+              --download-path batch-results \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME"
+
+            if [[ ! -f "$PREDICTIONS_FILE" ]]; then
+              echo "::error title=Missing predictions::File not found: $PREDICTIONS_FILE"
+              exit 1
+            fi
+
+            echo "File found: $PREDICTIONS_FILE"
+            PREDICTION_COUNT=$(( $(wc -l < "$PREDICTIONS_FILE") - 1 ))
+            if [[ ! -s "$PREDICTIONS_FILE" ]]; then
+              echo "::error title=Empty predictions::Predictions file is empty."
+              exit 1
+            fi
+            echo "prediction_count=$PREDICTION_COUNT" >> "$GITHUB_OUTPUT"
+
+            cat $PREDICTIONS_FILE
+            echo "::endgroup::"
+
+            echo "::group::Validate predictions"
+            set +e
+            python src/pipeline_scripts/validate_predictions.py $PREDICTIONS_FILE
+            VALIDATION_EXIT_CODE="$?"
+            set -e
+
+            if [[ "$VALIDATION_EXIT_CODE" -ne 0 ]]; then
+              echo "::error title=Prediction validation failed::$PREDICTIONS_FILE failed validation"
+              exit "$VALIDATION_EXIT_CODE"
+            fi
+            echo "::endgroup::"
+      - name: Set batch deployment as default
+        run: |
+          set -euo pipefail
+          echo "::group::Current default batch deployment"
+          PREVIOUS_DEFAULT="$(
+            az ml batch-endpoint show \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query defaults.deployment_name \
+              --output tsv
+          )"
+
+          echo "Previous default: ${PREVIOUS_DEFAULT:-none}"
+          echo "New default:      $BATCH_DEPLOYMENT_NAME"
+          echo "::endgroup::"
+
+          echo "::group::Update default batch deployment"
+          az ml batch-endpoint update \
+            --name "$BATCH_ENDPOINT_NAME" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --set "defaults.deployment_name=$BATCH_DEPLOYMENT_NAME" \
+            --output none
+          echo "::endgroup::"
+
+          CURRENT_DEFAULT="$(
+            az ml batch-endpoint show \
+              --name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query defaults.deployment_name \
+              --output tsv
+          )"
+
+          if [[ "$CURRENT_DEFAULT" != "$BATCH_DEPLOYMENT_NAME" ]]; then
+            echo "::error title=Default deployment update failed::Expected '$BATCH_DEPLOYMENT_NAME', found '${CURRENT_DEFAULT:-none}'"
+            exit 1
+          fi
+
+          {
+            echo "## Batch endpoint deployment"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`$BATCH_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$BATCH_DEPLOYMENT_NAME\` |"
+            echo "| Deployment state | \`Succeeded\` |"
+            echo "| Model | \`${MODEL_NAME}:${PROMOTED_MODEL_VERSION}\` |"
+            echo "| Feature data | \`${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION}\` |"
+            echo "| Test-data version | \`$PROMOTED_DATA_VERSION\` |"
+            echo "| Batch job | \`$BATCH_JOB_NAME\` |"
+            echo "| Prediction rows | \`${{ steps.validate_batch_output.outputs.prediction_count }}\` |"
+            echo "| Previous default | \`${PREVIOUS_DEFAULT:-none}\` |"
+            echo "| Current default | \`$CURRENT_DEFAULT\` |"
+            echo
+            echo "## Generated reports"
+            echo
+            echo "| Report | Artifact |"
+            echo "|---|---|"
+            echo "| Batch predictions | \`batch-predictions-${{ github.run_id }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload batch predictions
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-predictions-${{ github.run_id }}
+          path: batch-results/
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+  delete-orphan-deployments:
+    name: Delete old deployments
+    runs-on: ubuntu-latest
+    if: ${{ always() && !failure() && !cancelled() && github.ref == 'refs/heads/main' }}
+    needs: [update-rt-endpoint, update-batch-endpoint]
+    env:
+      BATCH_ENDPOINT_NAME: ${{ needs.update-batch-endpoint.outputs.batch_endpoint_name }}
+      RT_ENDPOINT_NAME: ${{ needs.update-rt-endpoint.outputs.rt_endpoint_name }}
+    steps:
+      - name: Login into Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+  
+      - name: Ensure Azure ML CLI v2 extension
+        run: |
+          set -euo pipefail
+          az extension add -n ml -y || az extension update -n ml
+  
+      - name: Delete real-time deployments with no traffic
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Query real-time endpoint"
+          
+
+          TRAFFIC_JSON="$(
+            az ml online-endpoint show \
+              --name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query traffic \
+              --output json
+          )"
+
+          DEPLOYMENTS_JSON="$(
+            az ml online-deployment list \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].{
+                name:name,
+                state:provisioning_state,
+                instanceType:instance_type
+              }' \
+              --output json
+          )"
+
+          DEPLOYMENT_COUNT="$(jq 'length' <<< "$DEPLOYMENTS_JSON")"
+          TRAFFIC_TOTAL="$(jq '[.[]] | add // 0' <<< "$TRAFFIC_JSON")"
+
+          echo "Endpoint:         $RT_ENDPOINT_NAME"
+          echo "Resource group:   $RG"
+          echo "Workspace:        $WORKSPACE_NAME"
+          echo "Deployment count: $DEPLOYMENT_COUNT"
+          echo "Traffic total:    ${TRAFFIC_TOTAL}%"
+          echo
+          echo "Current deployments:"
+
+          if [[ "$DEPLOYMENT_COUNT" -eq 0 ]]; then
+            echo "No real-time deployments exist."
+          else
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                ["DEPLOYMENT", "STATE", "INSTANCE TYPE", "TRAFFIC"],
+                (
+                  $deployments[]
+                  | [
+                      .name,
+                      .state,
+                      .instanceType,
+                      "\($traffic[.name] // 0)%"
+                    ]
+                )
+                | @tsv
+              ' |
+              column -t -s $'\t'
+          fi
+
+          echo "::endgroup::"
+
+          
+          # Explicitly declare the variables as arrays. This prevents
+          # unbound-variable errors when no deployments match.
+          NO_TRAFFIC_DEPLOYMENTS=()
+          DELETED_DEPLOYMENTS=()
+          SKIPPED_DEPLOYMENTS=()
+
+          mapfile -t NO_TRAFFIC_DEPLOYMENTS < <(
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                $deployments[]
+                | select(($traffic[.name] // 0) == 0)
+                | select(
+                    .state == "Succeeded" or
+                    .state == "Failed"
+                  )
+                | .name
+              '
+          )
+
+          mapfile -t SKIPPED_DEPLOYMENTS < <(
+            jq -nr \
+              --argjson deployments "$DEPLOYMENTS_JSON" \
+              --argjson traffic "$TRAFFIC_JSON" \
+              '
+                $deployments[]
+                | select(($traffic[.name] // 0) == 0)
+                | select(
+                    .state != "Succeeded" and
+                    .state != "Failed"
+                  )
+                | "\(.name) (\(.state))"
+              '
+          )
+
+          NO_TRAFFIC_COUNT="${#NO_TRAFFIC_DEPLOYMENTS[@]}"
+          SKIPPED_COUNT="${#SKIPPED_DEPLOYMENTS[@]}"
+
+          echo "::group::Real-time deployment cleanup plan"
+          echo "Eligible for deletion: $NO_TRAFFIC_COUNT"
+          echo "Skipped:               $SKIPPED_COUNT"
+
+          if [[ "$NO_TRAFFIC_COUNT" -eq 0 ]]; then
+            echo "No zero-traffic deployments are eligible for deletion."
+          else
+            echo
+            echo "Deployments to delete:"
+            printf '%s\n' "${NO_TRAFFIC_DEPLOYMENTS[@]}"
+          fi
+
+          if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+            echo
+            echo "Deployments skipped because of their state:"
+            printf '%s\n' "${SKIPPED_DEPLOYMENTS[@]}"
+          fi
+
+          echo "::endgroup::"
+
+          for DEPLOYMENT_NAME in "${NO_TRAFFIC_DEPLOYMENTS[@]}"; do
+            echo "::group::Delete deployment $DEPLOYMENT_NAME"
+
+            az ml online-deployment delete \
+              --name "$DEPLOYMENT_NAME" \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --yes
+
+            DELETED_DEPLOYMENTS+=("$DEPLOYMENT_NAME")
+
+            echo "Deleted deployment: $DEPLOYMENT_NAME"
+            echo "::endgroup::"
+          done
+
+          DELETED_COUNT="${#DELETED_DEPLOYMENTS[@]}"
+
+          REMAINING_DEPLOYMENTS_JSON="$(
+            az ml online-deployment list \
+              --endpoint-name "$RT_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].name' \
+              --output json
+          )"
+
+          REMAINING_COUNT="$(
+            jq 'length' <<< "$REMAINING_DEPLOYMENTS_JSON"
+          )"
+
+          echo "::group::Real-time deployment cleanup result"
+          echo "Deleted deployments:   $DELETED_COUNT"
+          echo "Skipped deployments:   $SKIPPED_COUNT"
+          echo "Remaining deployments: $REMAINING_COUNT"
+
+          if [[ "$REMAINING_COUNT" -gt 0 ]]; then
+            echo
+            echo "Remaining deployments:"
+            jq -r '.[]' <<< "$REMAINING_DEPLOYMENTS_JSON"
+          fi
+
+          echo "::endgroup::"
+
+          {
+            echo "## Real-time deployment cleanup"
+            echo
+            echo "| Result | Count |"
+            echo "|---|---:|"
+            echo "| Deleted | \`$DELETED_COUNT\` |"
+            echo "| Skipped | \`$SKIPPED_COUNT\` |"
+            echo "| Remaining | \`$REMAINING_COUNT\` |"
+            echo
+            echo "### Deleted deployments"
+            echo
+
+            if [[ "$DELETED_COUNT" -eq 0 ]]; then
+              echo "No real-time deployments were deleted."
+            else
+              for DEPLOYMENT_NAME in "${DELETED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT_NAME\`"
+              done
+            fi
+
+            if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+              echo
+              echo "### Skipped deployments"
+              echo
+
+              for DEPLOYMENT in "${SKIPPED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: Delete non-default batch deployments
+        run: | 
+          set -euo pipefail
+          DEFAULT_DEPLOYMENT=$(az ml batch-endpoint show -g "$RG" -w "$WORKSPACE_NAME" -n "$BATCH_ENDPOINT_NAME" --query "defaults.deployment_name" -o tsv)
+
+          if [[ -z "$DEFAULT_DEPLOYMENT" ||
+            "$DEFAULT_DEPLOYMENT" == "null" ]]; then
+            echo "::error title=Missing default batch deployment::Cleanup stopped to avoid deleting every batch deployment"
+            exit 1
+          fi
+          
+          echo "$DEFAULT_DEPLOYMENT"
+
+          BATCH_DEPLOYMENTS_JSON="$(
+            az ml batch-deployment list \
+              --endpoint-name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].{
+                name:name,
+                state:provisioning_state
+              }' \
+              --output json
+          )"
+          BATCH_DEPLOYMENT_COUNT="$(
+            jq 'length' <<< "$BATCH_DEPLOYMENTS_JSON"
+          )"
+
+          DEPLOYMENTS_TO_DEL=$(az ml batch-deployment list -g "$RG" -w "$WORKSPACE_NAME" -e "$BATCH_ENDPOINT_NAME" --query "[?name!='$DEFAULT_DEPLOYMENT'].[name, provisioning_state]" -o tsv)
+
+          echo "Endpoint:         $BATCH_ENDPOINT_NAME"
+          echo "Default:          $DEFAULT_DEPLOYMENT"
+          echo "Deployment count: $BATCH_DEPLOYMENT_COUNT"
+          echo
+          echo "Current deployments: $BATCH_DEPLOYMENTS_JSON"
+          echo "Delployments to delete: $DEPLOYMENTS_TO_DEL" 
+          
+          if [[ -z "$DEPLOYMENTS_TO_DEL" ]]; then
+            echo "No non-default deployments found."
+            exit 0
+          fi
+
+          DELETED_COUNT=0
+          DELETED_DEPLOYMENTS=()
+            
+          # Read name and state for each line
+          while read -r DEPLOYMENT_NAME STATE; do
+            echo "Checking $DEPLOYMENT_NAME (state: $STATE)"
+
+            # Optionally skip if still provisioning
+            if [[ "$STATE" != "Succeeded" && "$STATE" != "Failed" ]]; then
+              echo "Skipping $DEPLOYMENT_NAME (state not deletable)."
+              continue
+            fi
+          
+            echo "Deleting deployment: $DEPLOYMENT_NAME"
+            az ml batch-deployment delete \
+              -g "$RG" -w "$WORKSPACE_NAME" -e "$BATCH_ENDPOINT_NAME" \
+              -n "$DEPLOYMENT_NAME" --yes
+          
+            DELETED_DEPLOYMENTS+=("$DEPLOYMENT_NAME")
+            ((DELETED_COUNT+=1))
+
+          done <<< "$DEPLOYMENTS_TO_DEL"
+          
+          REMAINING_DEPLOYMENTS_JSON="$(
+            az ml batch-deployment list \
+              --endpoint-name "$BATCH_ENDPOINT_NAME" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --query '[].name' \
+              --output json
+          )"
+          REMAINING_COUNT="$(jq 'length' <<< "$REMAINING_DEPLOYMENTS_JSON")"
+
+
+          echo "Finished cleaning up non-default batch deployments." 
+
+          {
+            echo "## Batch deployment cleanup"
+            echo
+            echo "| Result | Count |"
+            echo "|---|---:|"
+            echo "| Deleted | \`$DELETED_COUNT\` |"
+            echo "| Remaining | \`$REMAINING_COUNT\` |"
+            echo
+            echo "### Default deployment"
+            echo
+            echo "- \`$DEFAULT_DEPLOYMENT\`"
+            echo
+            echo "### Deleted deployments"
+            echo
+            if [[ "$DELETED_COUNT" -eq 0 ]]; then
+              echo "No batch deployments were deleted."
+            else
+              for DEPLOYMENT_NAME in "${DELETED_DEPLOYMENTS[@]}"; do
+                echo "- \`$DEPLOYMENT_NAME\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

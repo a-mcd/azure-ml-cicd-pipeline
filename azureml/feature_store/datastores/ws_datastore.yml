@@ -1,0 +1,9 @@
+# azureml/feature_store/datastores/datastore.yml
+
+$schema: https://azuremlschemas.azureedge.net/latest/azureBlob.schema.json
+
+name: ${DATASTORE_NAME}
+type: azure_blob
+
+account_name: ${ACCOUNT_NAME}
+container_name: ${CONTAINER_NAME}

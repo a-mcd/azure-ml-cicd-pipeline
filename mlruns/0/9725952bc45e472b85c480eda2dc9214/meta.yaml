@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/9725952bc45e472b85c480eda2dc9214/artifacts
+end_time: 1783109825326
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 9725952bc45e472b85c480eda2dc9214
+run_name: bold-calf-221
+run_uuid: 9725952bc45e472b85c480eda2dc9214
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783109823542
+status: 3
+tags: []
+user_id: alisonmcdowell

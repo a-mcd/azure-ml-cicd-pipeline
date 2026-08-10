@@ -1,0 +1,16 @@
+$schema: http://azureml/sdk-2-0/FeatureStoreEntity.json
+
+name: $ENTITY_NAME
+version: "${ENTITY_VERSION}"
+description: Entity representing an individual Walmart store.
+
+index_columns:
+  - name: Store
+    type: integer
+
+stage: ${FS_STAGE}
+
+tags:
+  project: walmart-sales
+  data_type: nonPII
+

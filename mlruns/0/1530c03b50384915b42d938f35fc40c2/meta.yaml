@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/1530c03b50384915b42d938f35fc40c2/artifacts
+end_time: 1783116483233
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 1530c03b50384915b42d938f35fc40c2
+run_name: sneaky-goat-63
+run_uuid: 1530c03b50384915b42d938f35fc40c2
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783116481767
+status: 3
+tags: []
+user_id: alisonmcdowell

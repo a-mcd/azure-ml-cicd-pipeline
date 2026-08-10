@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/e3eb37459d914a74964258b8e6c7891e/artifacts
+end_time: 1783109641550
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: e3eb37459d914a74964258b8e6c7891e
+run_name: skillful-wasp-376
+run_uuid: e3eb37459d914a74964258b8e6c7891e
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783109639884
+status: 3
+tags: []
+user_id: alisonmcdowell

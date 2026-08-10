@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/d91cb099c84542ca9d388cf3860a3e0b/artifacts
+end_time: 1783439759167
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: d91cb099c84542ca9d388cf3860a3e0b
+run_name: bright-shrew-340
+run_uuid: d91cb099c84542ca9d388cf3860a3e0b
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783439748768
+status: 3
+tags: []
+user_id: alisonmcdowell

@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/1c32820b8ca1402c8f08d838effe2ac4/artifacts
+end_time: 1783109580526
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 1c32820b8ca1402c8f08d838effe2ac4
+run_name: traveling-deer-256
+run_uuid: 1c32820b8ca1402c8f08d838effe2ac4
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783109578835
+status: 3
+tags: []
+user_id: alisonmcdowell

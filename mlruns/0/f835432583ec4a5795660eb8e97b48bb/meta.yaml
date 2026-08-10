@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/f835432583ec4a5795660eb8e97b48bb/artifacts
+end_time: 1783118120047
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: f835432583ec4a5795660eb8e97b48bb
+run_name: sedate-whale-394
+run_uuid: f835432583ec4a5795660eb8e97b48bb
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783118118247
+status: 3
+tags: []
+user_id: alisonmcdowell

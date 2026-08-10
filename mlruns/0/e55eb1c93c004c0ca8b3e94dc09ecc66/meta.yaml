@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/e55eb1c93c004c0ca8b3e94dc09ecc66/artifacts
+end_time: 1783105426904
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: e55eb1c93c004c0ca8b3e94dc09ecc66
+run_name: legendary-gnat-187
+run_uuid: e55eb1c93c004c0ca8b3e94dc09ecc66
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783105424808
+status: 3
+tags: []
+user_id: alisonmcdowell

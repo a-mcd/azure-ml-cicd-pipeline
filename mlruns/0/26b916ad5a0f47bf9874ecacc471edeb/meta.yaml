@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/alisonmcdowell/Portfolio/azure-ml-cicd-pipeline/mlruns/0/26b916ad5a0f47bf9874ecacc471edeb/artifacts
+end_time: 1783111300739
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 26b916ad5a0f47bf9874ecacc471edeb
+run_name: bustling-cow-263
+run_uuid: 26b916ad5a0f47bf9874ecacc471edeb
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783111299872
+status: 3
+tags: []
+user_id: alisonmcdowell

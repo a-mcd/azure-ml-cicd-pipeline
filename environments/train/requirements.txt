@@ -1,0 +1,32 @@
+# ==========================
+# Core scientific stack
+# ==========================
+protobuf==3.20.3
+googleapis-common-protos<1.62.0   # avoids pulling protobuf>=4
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.2
+xgboost==2.1.1
+matplotlib==3.9.2
+seaborn==0.13.2
+
+
+# ==========================
+# Testing & CI dependencies
+# ==========================
+pytest==8.3.3
+pytest-cov==5.0.0         # optional: coverage reports
+pytest-mock==3.14.0       # useful for mocking XGBRegressor in integration tests
+
+
+
+# Azure ML stack (aligned versions)
+# azureml-mlflow==1.60.0.post1
+# azureml-core==1.60.0
+# azureml-defaults==1.60.0
+# azureml-dataset-runtime==1.60.0
+
+azure-ai-ml==1.32.0
+azure-identity
+mlflow<=2.16.2
+azureml-mlflow==1.62.0.post2

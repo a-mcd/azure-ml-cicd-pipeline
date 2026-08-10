@@ -1,0 +1,5 @@
+$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+name: ${ENDPOINT_ENVIRONMENT_NAME}
+conda_file: ../environments/endpoint/conda.yml
+description: Environment built from a custom conda.
+image: mcr.microsoft.com/azureml/curated/mlflow-py312-inference
