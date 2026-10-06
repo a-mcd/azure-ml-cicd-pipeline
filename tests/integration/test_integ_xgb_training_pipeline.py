@@ -125,7 +125,7 @@ def test_challenger_training_pipeline_end_to_end(
         sys,
         "argv",
         [
-            "xgb_walmart_model_script.py",
+            "xgb_walmart_training_script.py",
             "--training_data",
             str(training_dataset),
             "--n_estimators",

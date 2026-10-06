@@ -222,7 +222,7 @@ def test_main_trains_and_evaluates_candidate_model(
         sys,
         "argv",
         [
-            "xgb_walmart_model_script.py",
+            "xgb_walmart_training_script.py",
             "--training_data",
             "data/Walmart_Sales.csv",
         ],
@@ -392,7 +392,7 @@ def test_main_outputs_challenger_forecast(
         sys,
         "argv",
         [
-            "xgb_walmart_model_script.py",
+            "xgb_walmart_training_script.py",
             "--training_data",
             "data/Walmart_Sales.csv",
             "--challenger_model",
@@ -458,7 +458,7 @@ def test_main_requires_training_data_argument(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["xgb_walmart_model_script.py"],
+        ["xgb_walmart_training_script.py"],
     )
 
     with pytest.raises(SystemExit) as error:

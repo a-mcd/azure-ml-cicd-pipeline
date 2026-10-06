@@ -22,7 +22,7 @@ env:
   PYTHON_VERSION: "3.12"
 
   # Local source file in the repository.
-  WALMART_SALES_DATASET_PATH: data/Walmart_Sales_Updated_02-11-2012.csv
+  WALMART_SALES_DATASET_PATH: data/Walmart_Sales_02-11-2012.csv
 
   # Feature-store configuration.
   FEATURE_STORE_WS: "${{ vars.TEST_PREFIX }}_fs_ws"

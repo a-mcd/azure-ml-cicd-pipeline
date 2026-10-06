@@ -960,7 +960,7 @@ create_engineered_data(){
 
 
     export FEATURE_SET_NAME FEATURE_SET_VERSION
-    PYTHONPATH=. python3 src/walmart_ml/pipeline/create_all_weeks_features.py
+    PYTHONPATH=src python3 -m walmart_ml.pipeline.create_all_weeks_features
     
 }
 

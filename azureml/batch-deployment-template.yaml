@@ -28,5 +28,5 @@ settings:
   logging_level: debug
 
 code_configuration:
-  code: ..
-  scoring_script: src/walmart_ml/scoring/${SCORE_SCRIPT}
+  code: ../src
+  scoring_script: walmart_ml/scoring/${SCORE_SCRIPT}
