@@ -951,7 +951,7 @@ jobs:
       LATEST_PROCESSED_DATE: ${{ needs.retrieve-last-date.outputs.latestdate }}
       CHALLENGER_PREDICTIONS_FILE: challenger_predictions/artifacts/outputs/challenger_forecast_by_store.csv
       CHAMPION_PREDICTIONS_FILE: ${{ github.workspace }}/champion-rt-response.json
-      ACTUAL_VALUES_FILE: ${{ github.workspace }}/Walmart_Sales_Actual.csv
+      ACTUAL_VALUES_FILE: ${{ github.workspace }}/walmart_sales_actual.csv
     outputs:
       winner: ${{ steps.set_winner.outputs.winner }}
     steps:

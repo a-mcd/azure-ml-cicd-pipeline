@@ -22,14 +22,14 @@ def test_parse_arguments_reads_required_file(monkeypatch):
         [
             "get_latest_date.py",
             "--file",
-            "data/Walmart_Sales.csv",
+            "data/walmart_sales.csv",
         ],
     )
 
     result = get_latest_date_csv.parse_arguments()
 
     assert isinstance(result, argparse.Namespace)
-    assert result.file == "data/Walmart_Sales.csv"
+    assert result.file == "data/walmart_sales.csv"
     assert result.github_env is False
 
 
@@ -44,14 +44,14 @@ def test_parse_arguments_enables_github_environment_output(
         [
             "get_latest_date_csv.py",
             "--file",
-            "data/Walmart_Sales.csv",
+            "data/walmart_sales.csv",
             flag,
         ],
     )
 
     result = get_latest_date_csv.parse_arguments()
 
-    assert result.file == "data/Walmart_Sales.csv"
+    assert result.file == "data/walmart_sales.csv"
     assert result.github_env is True
 
 

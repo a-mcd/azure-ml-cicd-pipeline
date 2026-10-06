@@ -45,7 +45,7 @@ OFFLINE_STORE_SCOPE=""
 ENDPOINT_ENV_VERSION=""
 TRAINING_ENV_VERSION=""
 STORAGE_TYPE=""
-SOURCE_FILE="data/Walmart_Sales_26-10-2012.csv"
+SOURCE_FILE="data/walmart_sales_26-10-2012.csv"
 STORAGE_ACCOUNT=""
 
 if [[ $# -lt 2 ]]; then
@@ -98,8 +98,8 @@ fi
 
 ADLS_VERSION="1"
 ADLS_FILESYSTEM="walmart-source"
-ADLS_FILE_PATH_CURRENT="walmart-sales/current/Walmart_Sales.csv"
-ADLS_FILE_PATH_VERSIONS="walmart-sales/versions/${ADLS_VERSION}/Walmart_Sales.csv"
+ADLS_FILE_PATH_CURRENT="walmart-sales/current/walmart_sales.csv"
+ADLS_FILE_PATH_VERSIONS="walmart-sales/versions/${ADLS_VERSION}/walmart_sales.csv"
 SOURCE_STORAGE_ACCOUNT="$ADLS_ACCOUNT"
 
 # ========= Helpers =========

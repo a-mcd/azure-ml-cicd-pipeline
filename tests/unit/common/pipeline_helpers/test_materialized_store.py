@@ -196,7 +196,7 @@ def test_find_delta_roots_returns_empty_list_when_no_delta_tables_exist():
     # Purpose: Check that storage without Delta transaction logs produces an
     # empty result.
     storage_files = [
-        "raw/Walmart_Sales.csv",
+        "raw/walmart_sales.csv",
         "features/part-00001.parquet",
     ]
 

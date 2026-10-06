@@ -22,7 +22,7 @@ env:
   PYTHON_VERSION: "3.12"
 
   # Local source file in the repository.
-  WALMART_SALES_DATASET_PATH: data/Walmart_Sales_02-11-2012.csv
+  WALMART_SALES_DATASET_PATH: data/walmart_sales_02-11-2012.csv
 
   # Feature-store configuration.
   FEATURE_STORE_WS: "${{ vars.TEST_PREFIX }}_fs_ws"
@@ -34,8 +34,8 @@ env:
   ADLS_ACCOUNT: "${{ vars.TEST_PREFIX }}walmartlake"
   ADLS_FILESYSTEM: walmart-source
   ADLS_VERSION_ROOT: walmart-sales/versions
-  ADLS_FILENAME: Walmart_Sales.csv
-  ADLS_CURRENT_FILE_PATH: walmart-sales/current/Walmart_Sales.csv
+  ADLS_FILENAME: walmart_sales.csv
+  ADLS_CURRENT_FILE_PATH: walmart-sales/current/walmart_sales.csv
 
   # Exported Azure ML data asset.
   ENGINEERED_DATA_ASSET_NAME: walmart_materialized_features

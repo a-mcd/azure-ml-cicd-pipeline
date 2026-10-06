@@ -224,7 +224,7 @@ def test_main_trains_and_evaluates_candidate_model(
         [
             "xgb_walmart_training_script.py",
             "--training_data",
-            "data/Walmart_Sales.csv",
+            "data/walmart_sales.csv",
         ],
     )
 
@@ -232,7 +232,7 @@ def test_main_trains_and_evaluates_candidate_model(
 
     mocks["get_outputs_dir"].assert_called_once_with()
     mocks["load_dataset"].assert_called_once_with(
-        "data/Walmart_Sales.csv",
+        "data/walmart_sales.csv",
     )
     mocks["build_features"].assert_called_once_with(
         training_data["original"],
@@ -307,7 +307,7 @@ def test_main_trains_and_evaluates_candidate_model(
 
     mocks["log_param"].assert_any_call(
         "training_data",
-        os.path.abspath("data/Walmart_Sales.csv"),
+        os.path.abspath("data/walmart_sales.csv"),
     )
     mocks["log_param"].assert_any_call("test_horizon_weeks", 4)
     mocks["log_param"].assert_any_call("challenger_model", False)
@@ -318,7 +318,7 @@ def test_main_trains_and_evaluates_candidate_model(
 
     created_args = mocks["create_model"].call_args.args[0]
 
-    assert created_args.training_data == "data/Walmart_Sales.csv"
+    assert created_args.training_data == "data/walmart_sales.csv"
     assert created_args.n_estimators == 600
     assert created_args.eta == pytest.approx(0.05)
     assert created_args.max_depth == 8
@@ -394,7 +394,7 @@ def test_main_outputs_challenger_forecast(
         [
             "xgb_walmart_training_script.py",
             "--training_data",
-            "data/Walmart_Sales.csv",
+            "data/walmart_sales.csv",
             "--challenger_model",
             "--n_estimators",
             "800",
