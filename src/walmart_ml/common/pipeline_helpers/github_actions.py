@@ -1,4 +1,4 @@
-# src/walmart_ml/pipeline_scripts/github_actions.py
+# src/walmart_ml/pipeline/github_actions.py
 
 """Helpers for GitHub Actions workflows."""
 

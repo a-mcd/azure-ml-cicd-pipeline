@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  PYTHONPATH: .
+  PYTHONPATH: ${{ github.workspace }}/src
   MPLBACKEND: Agg
   RG: "${{ vars.PROD_PREFIX }}-rg"
   WORKSPACE_NAME: "${{ vars.PROD_PREFIX }}_workspace"
@@ -455,7 +455,7 @@ jobs:
 
           set -euo pipefail
 
-          python3 src/walmart_ml/pipeline_scripts/get_latest_date_csv.py --file $LOCAL_FILE --github_env
+          python3 src/walmart_ml/pipeline/get_latest_date_csv.py --file $LOCAL_FILE --github_env
 
       - name: Display uploaded file end date
         shell: bash
@@ -1418,7 +1418,7 @@ jobs:
 
             echo "::group::Validate predictions"
             set +e
-            python src/walmart_ml/pipeline_scripts/validate_predictions.py $PREDICTIONS_FILE
+            python src/walmart_ml/pipeline/validate_predictions.py $PREDICTIONS_FILE
             VALIDATION_EXIT_CODE="$?"
             set -e
 

@@ -45,7 +45,7 @@ OFFLINE_STORE_SCOPE=""
 ENDPOINT_ENV_VERSION=""
 TRAINING_ENV_VERSION=""
 STORAGE_TYPE=""
-SOURCE_FILE="data/Walmart_Sales.csv"
+SOURCE_FILE="data/Walmart_Sales_26-10-2012.csv"
 STORAGE_ACCOUNT=""
 
 if [[ $# -lt 2 ]]; then
@@ -960,7 +960,7 @@ create_engineered_data(){
 
 
     export FEATURE_SET_NAME FEATURE_SET_VERSION
-    PYTHONPATH=. python3 src/walmart_ml/pipeline_scripts/create_all_weeks_features.py
+    PYTHONPATH=. python3 src/walmart_ml/pipeline/create_all_weeks_features.py
     
 }
 

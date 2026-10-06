@@ -16,7 +16,7 @@ SCRIPT_PATH = (
     PROJECT_ROOT
     / "src"
     / "walmart_ml"
-    / "pipeline_scripts"
+    / "pipeline"
     / "validate_model_metrics.py"
 )
 
@@ -180,7 +180,7 @@ def test_validate_model_metrics_cli_end_to_end(
     command_log_path.touch()
 
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(PROJECT_ROOT)
+    environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
     environment["FAKE_COMMAND_LOG"] = str(
         command_log_path
     )

@@ -29,4 +29,4 @@ settings:
 
 code_configuration:
   code: ..
-  scoring_script: src/walmart_ml/score_scripts/${SCORE_SCRIPT}
+  scoring_script: src/walmart_ml/scoring/${SCORE_SCRIPT}

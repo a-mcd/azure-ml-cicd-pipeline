@@ -15,7 +15,7 @@ SCRIPT_PATH = (
     PROJECT_ROOT
     / "src"
     / "walmart_ml"
-    / "pipeline_scripts"
+    / "pipeline"
     / "validate_predictions.py"
 )
 
@@ -25,7 +25,7 @@ def run_validation(
 ) -> subprocess.CompletedProcess:
     """Run the prediction validator as a real CLI process."""
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(PROJECT_ROOT)
+    environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
 
     return subprocess.run(
         [

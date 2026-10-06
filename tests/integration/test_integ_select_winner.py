@@ -17,7 +17,7 @@ SCRIPT_PATH = (
     PROJECT_ROOT
     / "src"
     / "walmart_ml"
-    / "pipeline_scripts"
+    / "pipeline"
     / "select_winner.py"
 )
 

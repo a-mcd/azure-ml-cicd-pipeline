@@ -507,7 +507,7 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Read latest materialized date"
-          python src/walmart_ml/pipeline_scripts/get_latest_materialised_date.py \
+          python src/walmart_ml/pipeline/get_latest_materialised_date.py \
             --github-env
           echo "::endgroup::"
       
@@ -674,7 +674,7 @@ jobs:
           set -euo pipefail
 
           echo "::group::Validate candidate $ITER metrics"
-          python src/walmart_ml/pipeline_scripts/validate_model_metrics.py \
+          python src/walmart_ml/pipeline/validate_model_metrics.py \
             --iteration $ITER \
             --job_name $JOB_NAME \
             --rg "$RG" \
@@ -1177,7 +1177,7 @@ jobs:
               echo "| Endpoint | \`$RT_ENDPOINT_NAME\` |"
             } >> "$GITHUB_STEP_SUMMARY"
           else
-            python src/walmart_ml/pipeline_scripts/select_winner.py \
+            python src/walmart_ml/pipeline/select_winner.py \
               --challenger-predictions "$CHALLENGER_PREDICTIONS_FILE" \
               --champion-predictions "$CHAMPION_PREDICTIONS_FILE" \
               --github-output "$GITHUB_OUTPUT"
@@ -1660,7 +1660,7 @@ jobs:
           # Locust host is the full AzureML scoring URI; we call path ""
           set +e
           locust \
-            --locustfile src/walmart_ml/pipeline_scripts/locust_load_test.py \
+            --locustfile src/walmart_ml/pipeline/locust_load_test.py \
             --headless \
             --host "$SCORE_URI" \
             --users "$LOCUST_USERS" \
@@ -2135,7 +2135,7 @@ jobs:
 
             echo "::group::Validate predictions"
             set +e
-            python src/walmart_ml/pipeline_scripts/validate_predictions.py $PREDICTIONS_FILE
+            python src/walmart_ml/pipeline/validate_predictions.py $PREDICTIONS_FILE
             VALIDATION_EXIT_CODE="$?"
             set -e
 

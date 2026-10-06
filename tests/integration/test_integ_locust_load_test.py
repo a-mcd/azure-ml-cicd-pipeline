@@ -19,7 +19,7 @@ LOCUST_FILE = (
     PROJECT_ROOT
     / "src"
     / "walmart_ml"
-    / "pipeline_scripts"
+    / "pipeline"
     / "locust_load_test.py"
 )
 
@@ -122,7 +122,7 @@ def test_locust_sends_requests_and_passes_performance_gate(
     )
 
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(PROJECT_ROOT)
+    environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
     environment["LOCUST_PAYLOAD_PATH"] = str(payload_path)
     environment["AZUREML_TOKEN"] = "integration-test-token"
     environment["AZUREML_DEPLOYMENT"] = (

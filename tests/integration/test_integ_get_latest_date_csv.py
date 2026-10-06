@@ -25,7 +25,7 @@ def run_get_latest_date_csv(
     command = [
         sys.executable,
         "-m",
-        "walmart_ml.pipeline_scripts.get_latest_date_csv",
+        "walmart_ml.pipeline.get_latest_date_csv",
         "--file",
         str(csv_path),
     ]

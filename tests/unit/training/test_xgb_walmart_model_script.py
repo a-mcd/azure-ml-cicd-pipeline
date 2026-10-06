@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from walmart_ml.model_scripts import xgb_walmart_model_script as training_script
+from walmart_ml.training import xgb_walmart_training_script as training_script
 
 
 @pytest.fixture
