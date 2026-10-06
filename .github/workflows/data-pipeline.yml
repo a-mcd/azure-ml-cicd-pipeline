@@ -593,7 +593,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Source file: $WALMART_SALES_DATASET_PATH"
-          python3 src/pipeline_scripts/get_latest_date_csv.py --file $WALMART_SALES_DATASET_PATH --github_env
+          python3 src/walmart_ml/pipeline_scripts/get_latest_date_csv.py --file $WALMART_SALES_DATASET_PATH --github_env
 
       - name: Set materialisation end date
         shell: bash
@@ -667,7 +667,7 @@ jobs:
           echo "::endgroup::"
 
            echo "::group::Read latest materialised date"
-          python3 src/pipeline_scripts/get_latest_materialised_date.py  --github-env
+          python3 src/walmart_ml/pipeline_scripts/get_latest_materialised_date.py  --github-env
            echo "::endgroup::"
 
       
@@ -1171,7 +1171,7 @@ jobs:
 
           echo "::group::Export materialized features"
           echo "Exporting all materialized feature data..."
-          python3 src/pipeline_scripts/create_all_weeks_features.py
+          python3 src/walmart_ml/pipeline_scripts/create_all_weeks_features.py
           echo "::endgroup::"
 
           echo "::group::Validate materialized-feature export"
@@ -1976,7 +1976,7 @@ jobs:
 
             echo "::group::Validate predictions"
             set +e
-            python src/pipeline_scripts/validate_predictions.py $PREDICTIONS_FILE
+            python src/walmart_ml/pipeline_scripts/validate_predictions.py $PREDICTIONS_FILE
             VALIDATION_EXIT_CODE="$?"
             set -e
 

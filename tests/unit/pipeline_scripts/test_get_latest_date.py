@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.pipeline_scripts import get_latest_date_csv
+from walmart_ml.pipeline_scripts import get_latest_date_csv
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from src.common.scoring_helpers import scoring_utils
+from walmart_ml.common.scoring_helpers import scoring_utils
 
 
 # ---------------------------------------------------------------------------

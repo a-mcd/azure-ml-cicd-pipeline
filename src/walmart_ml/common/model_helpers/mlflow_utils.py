@@ -1,6 +1,6 @@
 import os
 import mlflow
-from src.common.model_helpers import config
+from walmart_ml.common.model_helpers import config
 
 def configure_mlflow() -> None:
     mlflow.set_registry_uri(os.getenv("MLFLOW_REGISTRY_URI", config.DEFAULT_REGISTRY_URI))

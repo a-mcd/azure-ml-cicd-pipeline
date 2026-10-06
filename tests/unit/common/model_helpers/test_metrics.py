@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.common.model_helpers.metrics import (
+from walmart_ml.common.model_helpers.metrics import (
     calculate_regression_metrics,
     mape,
 )
@@ -45,7 +45,7 @@ def test_mape_handles_zero_actual_values_without_division_error():
 def test_calculate_regression_metrics_logs_correct_metric_values(mocker, capsys):
     # Purpose: Check that calculate_regression_metrics logs the correct metric values,
     # prints a readable summary, and returns None.
-    mock_log_metric = mocker.patch("src.common.model_helpers.metrics.mlflow.log_metric")
+    mock_log_metric = mocker.patch("walmart_ml.common.model_helpers.metrics.mlflow.log_metric")
 
     y_test = np.array([100.0, 200.0, 300.0])
     preds = np.array([110.0, 190.0, 330.0])

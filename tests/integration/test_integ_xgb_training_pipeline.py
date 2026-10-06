@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 from mlflow.tracking import MlflowClient
 
-from src.model_scripts import xgb_walmart_model_script as training
+from walmart_ml.model_scripts import xgb_walmart_model_script as training
 
 
 pytestmark = pytest.mark.integration

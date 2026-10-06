@@ -2,10 +2,10 @@ import argparse
 import os
 import mlflow
 
-from src.common.model_helpers import (
+from walmart_ml.common.model_helpers import (
     validation
 )
-from src.common.model_helpers import config, data, encoding, features, metrics, mlflow_utils, model, outputs
+from walmart_ml.common.model_helpers import config, data, encoding, features, metrics, mlflow_utils, model, outputs
 
 
 # ----------------------------- Training -----------------------------------

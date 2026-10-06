@@ -1,6 +1,6 @@
 import pandas as pd
 import pytest
-from  src.common.model_helpers.validation import validate_missing_values
+from  walmart_ml.common.model_helpers.validation import validate_missing_values
 
 
 def test_validate_missing_values_passes_when_required_columns_have_no_missing_values():

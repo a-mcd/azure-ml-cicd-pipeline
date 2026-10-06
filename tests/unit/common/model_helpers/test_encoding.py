@@ -1,6 +1,6 @@
 import pandas as pd
 
-from src.common.model_helpers.encoding import (
+from walmart_ml.common.model_helpers.encoding import (
     get_feature_columns,
     prepare_encodings,
 )

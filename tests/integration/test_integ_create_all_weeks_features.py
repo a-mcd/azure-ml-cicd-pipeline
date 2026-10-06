@@ -24,7 +24,7 @@ os.environ.setdefault(
     "offline-store",
 )
 
-from src.pipeline_scripts import (  # noqa: E402
+from walmart_ml.pipeline_scripts import (  # noqa: E402
     create_all_weeks_features as exporter,
 )
 

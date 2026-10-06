@@ -3,12 +3,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from src.common.model_helpers.data import (
+from walmart_ml.common.model_helpers.data import (
     chronological_split,
     get_outputs_dir,
     load_dataset,
 )
-
 
 def test_get_outputs_dir_uses_local_outputs_when_not_in_azure(monkeypatch, tmp_path):
     # Purpose: Check that get_outputs_dir uses a local outputs directory

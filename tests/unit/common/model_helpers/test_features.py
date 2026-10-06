@@ -1,6 +1,6 @@
 import pandas as pd
 
-from src.common.model_helpers.features import (
+from walmart_ml.common.model_helpers.features import (
     align_to_feature_columns,
     build_features,
     prepare_calendar_features,

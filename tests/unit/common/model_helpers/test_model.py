@@ -2,13 +2,13 @@
 
 from types import SimpleNamespace
 from xgboost import XGBRegressor
-from  src.common.model_helpers import model
+from  walmart_ml.common.model_helpers import model
 
 
 def test_create_xgb_model_returns_xgb_regressor(mocker):
     # Purpose: Check that create_xgb_model returns an XGBRegressor object and 
     # create_xgb_model correctly applies args, config values, and fixed XGBoost settings.
-    mocker.patch("src.common.model_helpers.config.RANDOM_STATE", 123)
+    mocker.patch("walmart_ml.common.model_helpers.config.RANDOM_STATE", 123)
 
     args = SimpleNamespace(
         n_estimators=600,

@@ -1,5 +1,5 @@
 import pandas as pd
-from src.common.model_helpers import config
+from walmart_ml.common.model_helpers import config
 
 def prepare_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     """

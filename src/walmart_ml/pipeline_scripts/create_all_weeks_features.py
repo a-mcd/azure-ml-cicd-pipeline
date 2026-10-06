@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 from pyspark.sql import functions as F
-from src.common.pipeline_helpers.materialized_store import (
+from walmart_ml.common.pipeline_helpers.materialized_store import (
     create_delta_spark_session,
     find_delta_roots,
     list_storage_files,

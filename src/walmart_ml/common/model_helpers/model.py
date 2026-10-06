@@ -1,5 +1,5 @@
 from xgboost import XGBRegressor
-from src.common.model_helpers import config
+from walmart_ml.common.model_helpers import config
 
 def create_xgb_model(args) -> XGBRegressor:
     return XGBRegressor(

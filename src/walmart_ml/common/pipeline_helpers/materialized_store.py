@@ -1,4 +1,4 @@
-# src/pipeline_scripts/materialized_store.py
+# src/walmart_ml/pipeline_scripts/materialized_store.py
 
 """Utilities for accessing the materialized Delta feature store."""
 

@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOCUST_FILE = (
     PROJECT_ROOT
     / "src"
+    / "walmart_ml"
     / "pipeline_scripts"
     / "locust_load_test.py"
 )

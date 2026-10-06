@@ -37,7 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # This import must follow the sys.path configuration above.
 # pylint: disable=wrong-import-position
-from src.common.scoring_helpers.scoring_utils import (
+from walmart_ml.common.scoring_helpers.scoring_utils import (
     download_data_asset_csv,
     get_required_environment_variable,
     load_feature_data,

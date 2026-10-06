@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.score_scripts import walmart_realtime_score as realtime_score
+from walmart_ml.score_scripts import walmart_realtime_score as realtime_score
 
 
 

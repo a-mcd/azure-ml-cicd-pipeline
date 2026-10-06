@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.common.pipeline_helpers.github_actions import write_environment_variables
+from walmart_ml.common.pipeline_helpers.github_actions import write_environment_variables
 
 
 def test_write_environment_variables_writes_all_values(

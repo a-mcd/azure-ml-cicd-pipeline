@@ -3,7 +3,7 @@
 import subprocess
 
 import pytest
-from src.common.pipeline_helpers import materialized_store
+from walmart_ml.common.pipeline_helpers import materialized_store
 
 
 
@@ -11,7 +11,7 @@ def test_list_storage_files_returns_clean_non_empty_paths(mocker):
     # Purpose: Check that Azure CLI output is split into clean file paths
     # while blank lines are ignored.
     mock_run = mocker.patch(
-        "src.common.pipeline_helpers.materialized_store.subprocess.run",
+        "walmart_ml.common.pipeline_helpers.materialized_store.subprocess.run",
     )
     mock_run.return_value.stdout = (
         "features/table/_delta_log/00001.json\n"
@@ -35,7 +35,7 @@ def test_list_storage_files_runs_expected_azure_cli_command(mocker):
     # Purpose: Check that files are requested recursively from the specified
     # Azure Data Lake filesystem.
     mock_run = mocker.patch(
-        "src.common.pipeline_helpers.materialized_store.subprocess.run",
+        "walmart_ml.common.pipeline_helpers.materialized_store.subprocess.run",
     )
     mock_run.return_value.stdout = ""
 
@@ -77,7 +77,7 @@ def test_list_storage_files_runs_expected_azure_cli_command(mocker):
 def test_list_storage_files_propagates_azure_cli_failure(mocker):
     # Purpose: Check that Azure CLI failures are not silently ignored.
     mocker.patch(
-        "src.common.pipeline_helpers.materialized_store.subprocess.run",
+        "walmart_ml.common.pipeline_helpers.materialized_store.subprocess.run",
         side_effect=subprocess.CalledProcessError(
             returncode=1,
             cmd=["az", "storage", "fs", "file", "list"],
@@ -110,7 +110,7 @@ def test_create_delta_spark_session_configures_and_creates_session(mocker):
     configured_builder.getOrCreate.return_value = expected_session
 
     mock_configure_delta = mocker.patch(
-        "src.common.pipeline_helpers.materialized_store."
+        "walmart_ml.common.pipeline_helpers.materialized_store."
         "configure_spark_with_delta_pip",
         return_value=configured_builder,
     )

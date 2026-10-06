@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from  src.common.model_helpers import mlflow_utils
+from  walmart_ml.common.model_helpers import mlflow_utils
 
 
 def test_configure_mlflow_uses_default_registry_uri_when_env_var_missing(
@@ -18,9 +18,9 @@ def test_configure_mlflow_uses_default_registry_uri_when_env_var_missing(
         ),
     )
 
-    mocker.patch("src.common.model_helpers.mlflow_utils.mlflow", mock_mlflow)
+    mocker.patch("walmart_ml.common.model_helpers.mlflow_utils.mlflow", mock_mlflow)
     mocker.patch(
-        "src.common.model_helpers.mlflow_utils.config.DEFAULT_REGISTRY_URI",
+        "walmart_ml.common.model_helpers.mlflow_utils.config.DEFAULT_REGISTRY_URI",
         "azureml://default-registry-uri",
     )
 
@@ -46,9 +46,9 @@ def test_configure_mlflow_uses_env_registry_uri_when_set(
         ),
     )
 
-    mocker.patch("src.common.model_helpers.mlflow_utils.mlflow", mock_mlflow)
+    mocker.patch("walmart_ml.common.model_helpers.mlflow_utils.mlflow", mock_mlflow)
     mocker.patch(
-        "src.common.model_helpers.mlflow_utils.config.DEFAULT_REGISTRY_URI",
+        "walmart_ml.common.model_helpers.mlflow_utils.config.DEFAULT_REGISTRY_URI",
         "azureml://default-registry-uri",
     )
 
@@ -74,7 +74,7 @@ def test_configure_mlflow_enables_xgboost_autolog_with_expected_settings(
         ),
     )
 
-    mocker.patch("src.common.model_helpers.mlflow_utils.mlflow", mock_mlflow)
+    mocker.patch("walmart_ml.common.model_helpers.mlflow_utils.mlflow", mock_mlflow)
 
     mlflow_utils.configure_mlflow()
 
@@ -101,7 +101,7 @@ def test_configure_mlflow_returns_none(
         ),
     )
 
-    mocker.patch("src.common.model_helpers.mlflow_utils.mlflow", mock_mlflow)
+    mocker.patch("walmart_ml.common.model_helpers.mlflow_utils.mlflow", mock_mlflow)
 
     result = mlflow_utils.configure_mlflow()
 

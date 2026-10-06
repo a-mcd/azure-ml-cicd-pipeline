@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 import pytest
 
-from src.pipeline_scripts import get_latest_materialised_date as latest_date
+from walmart_ml.pipeline_scripts import get_latest_materialised_date as latest_date
 
 
 @pytest.fixture

@@ -11,12 +11,6 @@ import pytest
 pytestmark = pytest.mark.integration
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = (
-    PROJECT_ROOT
-    / "src"
-    / "pipeline_scripts"
-    / "get_latest_date_csv.py"
-)
 
 
 def run_get_latest_date_csv(
@@ -26,11 +20,12 @@ def run_get_latest_date_csv(
 ) -> subprocess.CompletedProcess:
     """Run get_latest_date_csv.py as a real CLI process."""
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(PROJECT_ROOT)
+    environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
 
     command = [
         sys.executable,
-        str(SCRIPT_PATH),
+        "-m",
+        "walmart_ml.pipeline_scripts.get_latest_date_csv",
         "--file",
         str(csv_path),
     ]

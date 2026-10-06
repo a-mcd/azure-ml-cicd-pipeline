@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 from pandas.errors import MergeError
 
-from src.pipeline_scripts import select_winner as selection
+from walmart_ml.pipeline_scripts import select_winner as selection
 
 
 @pytest.fixture

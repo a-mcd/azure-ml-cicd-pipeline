@@ -10,8 +10,8 @@ from datetime import date, datetime
 from pyspark.errors import PySparkException
 from pyspark.sql import functions as F
 from py4j.protocol import Py4JError
-from src.common.pipeline_helpers.github_actions import write_environment_variables
-from src.common.pipeline_helpers.materialized_store import (
+from walmart_ml.common.pipeline_helpers.github_actions import write_environment_variables
+from walmart_ml.common.pipeline_helpers.materialized_store import (
     create_delta_spark_session,
     list_storage_files,
     find_delta_roots,

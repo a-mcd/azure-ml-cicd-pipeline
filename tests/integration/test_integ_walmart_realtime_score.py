@@ -8,7 +8,7 @@ import pytest
 import xgboost as xgb
 
 # Update this import if the scoring script has a different module name.
-from src.score_scripts import walmart_realtime_score as scoring
+from walmart_ml.score_scripts import walmart_realtime_score as scoring
 
 
 pytestmark = pytest.mark.integration

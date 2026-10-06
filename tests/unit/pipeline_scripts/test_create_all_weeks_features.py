@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 
-MODULE_NAME = "src.pipeline_scripts.create_all_weeks_features"
+MODULE_NAME = "walmart_ml.pipeline_scripts.create_all_weeks_features"
 
 
 @pytest.fixture

@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 import numpy as np
 
-from src.common.model_helpers.outputs import (
+from walmart_ml.common.model_helpers.outputs import (
     output_dataset,
     output_feature_importance,
     output_train_test_sets,

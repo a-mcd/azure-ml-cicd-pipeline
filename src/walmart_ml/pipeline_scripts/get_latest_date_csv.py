@@ -8,7 +8,7 @@ import csv
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from src.common.pipeline_helpers.github_actions import write_environment_variables
+from walmart_ml.common.pipeline_helpers.github_actions import write_environment_variables
 
 
 DATE_COLUMN = "Date"

@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = (
     PROJECT_ROOT
     / "src"
+    / "walmart_ml"
     / "pipeline_scripts"
     / "select_winner.py"
 )
