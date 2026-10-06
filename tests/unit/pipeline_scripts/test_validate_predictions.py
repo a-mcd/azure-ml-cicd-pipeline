@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from walmart_ml.pipeline_scripts import validate_predictions as validation
+from walmart_ml.pipeline import validate_predictions as validation
 
 
 @pytest.fixture

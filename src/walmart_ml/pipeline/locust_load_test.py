@@ -4,7 +4,7 @@ from pathlib import Path
 from locust import HttpUser, task, between, events
 
 # Load a sample payload once
-PAYLOAD_PATH = os.getenv("LOCUST_PAYLOAD_PATH", "tests/test.json")
+PAYLOAD_PATH = os.getenv("LOCUST_PAYLOAD_PATH", "tests/test_data.json")
 with open(PAYLOAD_PATH, "r", encoding="utf-8") as f:
     REQUEST_BODY = json.load(f)
 

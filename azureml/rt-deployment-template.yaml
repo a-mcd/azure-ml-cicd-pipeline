@@ -30,5 +30,5 @@ request_settings:
   max_concurrent_requests_per_instance: 1
   request_timeout_ms: 90000
 code_configuration:
-  code: ../src
-  scoring_script: walmart_ml/score_scripts/${SCORE_SCRIPT}
+  code: ..
+  scoring_script: src/walmart_ml/score_scripts/${SCORE_SCRIPT}

@@ -1,7 +1,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
-code: ..
+code: ../src
 command: >
-  PYTHONPATH=. python src/walmart_ml/model_scripts/${{ inputs.script_name }}
+  PYTHONPATH=. python -m walmart_ml.model_scripts.${{ inputs.script_name }}
   --training_data ${{ inputs.training_data }}
   --eta ${{ inputs.eta }}
   --max_depth ${{ inputs.max_depth }}

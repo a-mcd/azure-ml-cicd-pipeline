@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 import xgboost as xgb
 
-from walmart_ml.score_scripts import walmart_batch_score as scoring
+from walmart_ml.scoring import walmart_batch_score as scoring
 
 
 pytestmark = pytest.mark.integration

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from walmart_ml.pipeline_scripts import locust_load_test as load_test
+from walmart_ml.pipeline import locust_load_test as load_test
 
 
 def create_user(mocker):

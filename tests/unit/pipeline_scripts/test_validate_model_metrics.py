@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from walmart_ml.pipeline_scripts import validate_model_metrics as validation
+from walmart_ml.pipeline import validate_model_metrics as validation
 
 
 @pytest.fixture

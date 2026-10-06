@@ -6,7 +6,7 @@ import pytest
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession
 
-from walmart_ml.pipeline_scripts import (
+from walmart_ml.pipeline import (
     get_latest_materialised_date as latest_date,
 )
 
