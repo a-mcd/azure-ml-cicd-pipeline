@@ -800,10 +800,19 @@ create_feature_store(){
 
         info "Feature set already exists: ${FEATURE_SET_NAME}:${FEATURE_SET_VERSION}"
     else
-        az ml feature-set create \
-            --file "$feature_set_yaml" \
-            --resource-group "$RG" \
-            --feature-store-name "$FEATURE_STORE_WS"
+        # Retry in case the storage role assignment is still being applied.
+        local create_attempt
+        for ((create_attempt=1; create_attempt<=5; create_attempt++)); do
+            if az ml feature-set create \
+                --file "$feature_set_yaml" \
+                --resource-group "$RG" \
+                --feature-store-name "$FEATURE_STORE_WS"; then
+                break
+            fi
+            (( create_attempt < 5 )) || fail "Could not create feature set ${FEATURE_SET_NAME}:${FEATURE_SET_VERSION}."
+            info "Feature set creation failed; retrying in 60 seconds (attempt $create_attempt/5)"
+            sleep 60
+        done
 
         info "Feature set created: ${FEATURE_SET_NAME}:${FEATURE_SET_VERSION}"
     fi
@@ -1329,6 +1338,7 @@ configure_storage_access() {
     ensure_role_assignment "$materialization_principal_id" "ServicePrincipal" "Storage Blob Data Contributor" "$OFFLINE_STORE_SCOPE"
 
     wait_for_selected_source_access 20 30
+    wait_for_feature_store_storage_access 20 30
     info "Allowing additional time for the materialization identity..."
     sleep 60
 }
@@ -1348,6 +1358,27 @@ wait_for_selected_source_access() {
         sleep "$delay_seconds"
     done
     fail "$STORAGE_TYPE access did not become available."
+}
+
+# New data-plane role assignments can take several minutes to apply. Creating
+# a feature set uploads its spec to the feature store's storage account with
+# the caller's identity, so wait until that account accepts the caller.
+wait_for_feature_store_storage_access() {
+    local max_attempts="${1:-20}"
+    local delay_seconds="${2:-30}"
+    local storage_account="${FEATURE_STORE_STORAGE_ID##*/}"
+    local attempt
+
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        az storage container list \
+            --account-name "$storage_account" \
+            --auth-mode login \
+            --num-results 1 \
+            --output none >/dev/null 2>&1 && return 0
+        info "Waiting for feature-store storage access: attempt $attempt/$max_attempts"
+        sleep "$delay_seconds"
+    done
+    fail "Feature-store storage access did not become available."
 }
 
 ensure_role_assignment() {
