@@ -1,0 +1,26 @@
+name: Delete non-default batch deployments
+description: >-
+  Delete every deployment on a batch endpoint except the default one.
+  Stops without deleting anything if the endpoint has no default.
+
+inputs:
+  endpoint-name:
+    description: Batch endpoint name.
+    required: true
+  resource-group:
+    description: Resource group of the workspace.
+    required: true
+  workspace-name:
+    description: Azure ML workspace holding the endpoint.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Delete non-default deployments
+      shell: bash
+      env:
+        BATCH_ENDPOINT_NAME: ${{ inputs.endpoint-name }}
+        RG: ${{ inputs.resource-group }}
+        WORKSPACE_NAME: ${{ inputs.workspace-name }}
+      run: ${{ github.action_path }}/delete-non-default-batch-deployments.sh

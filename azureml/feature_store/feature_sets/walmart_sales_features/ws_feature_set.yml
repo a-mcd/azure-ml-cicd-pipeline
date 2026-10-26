@@ -1,0 +1,34 @@
+$schema: http://azureml/sdk-2-0/Featureset.json
+
+name: $FEATURE_SET_NAME
+version: "${FEATURE_SET_VERSION}"
+
+description: >
+  Walmart store sales features containing calendar, economic,
+  holiday, lag and rolling sales features.
+
+specification:
+  path: ./spec
+
+entities:
+  - azureml:$ENTITY_NAME:$ENTITY_VERSION
+
+stage: ${FS_STAGE}
+
+tags:
+  project: walmart-sales
+  feature_group: sales-forecasting
+  data_type: nonPII
+
+materialization_settings:
+  offline_enabled: true
+
+  resource:
+    instance_type: Standard_E4s_v3
+
+  spark_configuration:
+    spark.driver.cores: 2
+    spark.driver.memory: 16g
+    spark.executor.cores: 2
+    spark.executor.memory: 16g
+    spark.executor.instances: 2

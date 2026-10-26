@@ -1,0 +1,781 @@
+####
+# Promotes the data and model to the production workspace
+####
+name: Walmart Promote to Production
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+  MPLBACKEND: Agg
+  RG: "${{ vars.PROD_PREFIX }}-rg"
+  WORKSPACE_NAME: "${{ vars.PROD_PREFIX }}_workspace"
+  ENDPOINT_ENVIRONMENT: "${{ vars.PROD_PREFIX }}-endpoint-env:${{ vars.PROD_ENDPOINT_ENV_VERSION }}"
+  RT_ENDPOINT_PREFIX: "rt-walmart-sales-"
+  BATCH_ENDPOINT_PREFIX: "batch-walmart-sales"
+  MODEL_NAME: "walmart-xgb"
+  TEST_DATA: "test_data"
+  FEATURE_DATA_ASSET_NAME: "walmart_materialized_features"
+  PROMOTED_DATA_VERSION: "${{ vars.PROMOTED_DATA_VERSION }}"
+  PROMOTED_MODEL_VERSION: "${{ vars.PROMOTED_MODEL_VERSION }}"
+
+  # --- Test workspace where the data is produced ---
+  TEST_RG: "${{ vars.TEST_PREFIX }}-rg"
+  TEST_WORKSPACE_NAME: "${{ vars.TEST_PREFIX }}_workspace"
+
+  ARTIFACT_RETENTION_DAYS: 30
+
+  # Longest an Azure ML job may run before the workflow cancels it.
+  AML_JOB_TIMEOUT_MINUTES: 60
+
+jobs:
+  check-model-version:
+    name: Check if the promoted model version exists in production
+    runs-on: ubuntu-latest
+    outputs:
+      model-version-exists: ${{ steps.check-model-version.outputs.model-version-exists }}
+    steps:
+      - name: Check out workflow actions and scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Check promoted model version
+        id: check-model-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az ml model show \
+            --name "$MODEL_NAME" \
+            --version "$PROMOTED_MODEL_VERSION" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --only-show-errors \
+            >/dev/null 2>&1; then
+
+            echo "model-version-exists=true" >> "$GITHUB_OUTPUT"
+            echo "Model exists: ${MODEL_NAME}:${PROMOTED_MODEL_VERSION}"
+          else
+            echo "model-version-exists=false" >> "$GITHUB_OUTPUT"
+            echo "Model does not exist: ${MODEL_NAME}:${PROMOTED_MODEL_VERSION}"
+          fi
+
+      - name: Model check summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODEL_VERSION_EXISTS="${{ steps.check-model-version.outputs.model-version-exists }}"
+
+          {
+            echo "## Production Model Version Check"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Model | \`${MODEL_NAME}\` |"
+            echo "| Version | \`${PROMOTED_MODEL_VERSION}\` |"
+            echo "| Workspace | \`${WORKSPACE_NAME}\` |"
+            echo "| Resource group | \`${RG}\` |"
+            echo "| Model exists | \`${MODEL_VERSION_EXISTS}\` |"
+            echo
+
+            if [[ "$MODEL_VERSION_EXISTS" == "true" ]]; then
+              echo "Model \`${MODEL_NAME}:${PROMOTED_MODEL_VERSION}\` already exists in production."
+            else
+              echo "Model \`${MODEL_NAME}:${PROMOTED_MODEL_VERSION}\` does not exist in production."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  download-model:
+    name: Download model from test workspace
+    runs-on: ubuntu-latest
+    needs: check-model-version
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.check-model-version.outputs.model-version-exists == 'false'}}
+    steps:
+      - name: Check out workflow actions and scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Download model from test workspace
+        run: |
+          set -euo pipefail
+          LOCAL_FILE="./downloaded-model/model"
+          mkdir -p "$(dirname "$LOCAL_FILE")"
+
+          az ml model download \
+            --name "$MODEL_NAME" \
+            --version "$PROMOTED_MODEL_VERSION" \
+            --resource-group "$TEST_RG" \
+            --workspace-name "$TEST_WORKSPACE_NAME" \
+            --download-path "$LOCAL_FILE" \
+            --only-show-errors
+
+          MODEL_FILE="./downloaded-model/model/walmart-xgb/model/model.xgb"
+          MODEL_SIZE="$(du -h "$MODEL_FILE" | cut -f1)"
+          echo "MODEL_SIZE=$MODEL_SIZE" >> "$GITHUB_ENV"
+
+          echo "Model file: $MODEL_FILE"
+          echo "Model size: $MODEL_SIZE"
+          echo
+          echo "Downloaded files:"
+          find "$LOCAL_FILE" -type f -exec ls -lh {} \;
+
+          test -s "$MODEL_FILE" || {
+            echo "::error title=Download failed::The downloaded feature data file is missing or empty."
+            exit 1
+          }
+
+          ls -lh "$LOCAL_FILE"
+
+          {
+            echo "## Model download"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Source workspace | \`$TEST_WORKSPACE_NAME\` |"
+            echo "| Model | \`$MODEL_NAME\` |"
+            echo "| Version | \`$PROMOTED_MODEL_VERSION\` |"
+            echo "| Model file | \`$MODEL_FILE\` |"
+            echo "| Size | $MODEL_SIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model_artifact
+          path: ./downloaded-model/model
+          if-no-files-found: error
+
+  upload-model:
+    name: Upload model to production
+    runs-on: ubuntu-latest
+    needs: download-model
+    if: ${{ success() && github.ref == 'refs/heads/main'}}
+    steps:
+      - name: Check out workflow actions and scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Download artifacts from test job
+        uses: actions/download-artifact@v4
+        with:
+          name: model_artifact
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Upload model to production workspace
+        run: |
+          set -euo pipefail
+          MODEL_PATH="./walmart-xgb/model/model.xgb"
+          echo "Model path: $MODEL_PATH"
+
+          if [[ ! -s "$MODEL_PATH" ]]; then
+            echo "::error title=Missing model::Model file not found or empty: $MODEL_PATH"
+            find . -maxdepth 5 -type f -print
+            exit 1
+          fi
+
+          echo "Registering model in production workspace: $RG / $WORKSPACE_NAME"
+          echo "Model path: $MODEL_PATH"
+          MODEL_SIZE="$(du -h "$MODEL_PATH" | cut -f1)"
+          echo "MODEL_SIZE=$MODEL_SIZE" >> "$GITHUB_ENV"
+
+          echo "Model size: $MODEL_SIZE"
+
+          MODEL_JSON="$(
+            az ml model create \
+              --name "$MODEL_NAME" \
+              --version "$PROMOTED_MODEL_VERSION" \
+              --path "$MODEL_PATH" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json
+          )"
+
+          NEW_VERSION=$(echo "$MODEL_JSON" | jq -r '.version')
+          echo "Model registered in PROD as version: $NEW_VERSION"
+          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
+
+          # Validate that Azure ML returned the expected version
+          if [[ "$NEW_VERSION" != "$PROMOTED_MODEL_VERSION" ]]; then
+              echo "ERROR: Azure ML returned version '$NEW_VERSION' but expected '$PROMOTED_MODEL_VERSION'"
+              echo "This means the model upload did not use the correct version."
+              exit 1
+          fi
+
+      - name: Verify model uploaded successfully
+        run: |
+          REGISTERED_MODEL_JSON="$(
+            az ml model show \
+              --name "$MODEL_NAME" \
+              --version "$PROMOTED_MODEL_VERSION" \
+              --resource-group "$RG" \
+              --workspace-name "$WORKSPACE_NAME" \
+              --output json \
+              --only-show-errors
+          )"
+
+          REGISTERED_VERSION="$(
+            jq -r '.version // empty' <<< "$REGISTERED_MODEL_JSON"
+          )"
+
+          if [[ -z "$REGISTERED_VERSION" ]]; then
+            echo "::error title=Model verification failed::Unable to retrieve ${MODEL_NAME}:${PROMOTED_MODEL_VERSION} from production"
+            exit 1
+          fi
+
+          if [[ "$REGISTERED_VERSION" != "$PROMOTED_MODEL_VERSION" ]]; then
+            echo "::error title=Model verification failed::Retrieved version '$REGISTERED_VERSION', expected '$PROMOTED_MODEL_VERSION'"
+            exit 1
+          fi
+
+          {
+            echo "## Production model upload"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Resource group | \`$RG\` |"
+            echo "| Workspace | \`$WORKSPACE_NAME\` |"
+            echo "| Model | \`$MODEL_NAME\` |"
+            echo "| Version | \`$NEW_VERSION\` |"
+            echo "| Model size | $MODEL_SIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  check-data-version:
+    name: Check if the promoted data version exists in production
+    runs-on: ubuntu-latest
+    outputs:
+      feature-data-version-exists: ${{ steps.check-feature-data-version.outputs.feature-data-version-exists }}
+      test-data-version-exists: ${{ steps.check-test-data-version.outputs.test-data-version-exists }}
+    steps:
+      - name: Check out workflow actions and scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Check promoted feature data version
+        id: check-feature-data-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az ml data show \
+            --name "$FEATURE_DATA_ASSET_NAME" \
+            --version "$PROMOTED_DATA_VERSION" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --only-show-errors \
+            >/dev/null 2>&1; then
+
+            echo "feature-data-version-exists=true" >> "$GITHUB_OUTPUT"
+            echo "Data asset exists: ${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION}"
+          else
+            echo "feature-data-version-exists=false" >> "$GITHUB_OUTPUT"
+            echo "Data asset does not exist: ${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION}"
+          fi
+
+      - name: Check promoted test data version
+        id: check-test-data-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az ml data show \
+            --name "$TEST_DATA" \
+            --version "$PROMOTED_DATA_VERSION" \
+            --resource-group "$RG" \
+            --workspace-name "$WORKSPACE_NAME" \
+            --only-show-errors \
+            >/dev/null 2>&1; then
+
+            echo "test-data-version-exists=true" >> "$GITHUB_OUTPUT"
+            echo "Data asset exists: ${TEST_DATA}:${PROMOTED_DATA_VERSION}"
+          else
+            echo "test-data-version-exists=false" >> "$GITHUB_OUTPUT"
+            echo "Data asset does not exist: ${TEST_DATA}:${PROMOTED_DATA_VERSION}"
+          fi
+
+      - name: Create data version summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          FEATURE_DATA_EXISTS: ${{ steps.check-feature-data-version.outputs.feature-data-version-exists }}
+          TEST_DATA_EXISTS: ${{ steps.check-test-data-version.outputs.test-data-version-exists }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Production data version check"
+            echo
+            echo "| Data asset | Version | Exists |"
+            echo "|---|---|---|"
+            echo "| \`$FEATURE_DATA_ASSET_NAME\` | \`$PROMOTED_DATA_VERSION\` | **${FEATURE_DATA_EXISTS:-unknown}** |"
+            echo "| \`$TEST_DATA\` | \`$PROMOTED_DATA_VERSION\` | **${TEST_DATA_EXISTS:-unknown}** |"
+            echo
+            echo "Workspace: \`$WORKSPACE_NAME\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  download-feature-data:
+    name: Download feature data from test workspace
+    runs-on: ubuntu-latest
+    needs: check-data-version
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    outputs:
+      latest-processed-date: ${{ steps.set-end-date.outputs.latestdate }}
+    env:
+      LOCAL_FILE: "./downloaded-feature-data/walmart_materialized_features_all_weeks.csv"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Download feature data from test workspace
+        env:
+          ASSET_NAME: ${{ env.FEATURE_DATA_ASSET_NAME }}
+          ASSET_VERSION: ${{ env.PROMOTED_DATA_VERSION }}
+          SOURCE_RG: ${{ env.TEST_RG }}
+          SOURCE_WORKSPACE_NAME: ${{ env.TEST_WORKSPACE_NAME }}
+          LABEL: "feature data"
+          ENV_PREFIX: FEATURE_DATA
+        run: .github/scripts/download-data-asset.sh
+
+      - name: Set up Python and install walmart_ml
+        uses: ./.github/actions/python-setup
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Get end date from uploaded feature data
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          python3 src/walmart_ml/pipeline/get_latest_date_csv.py --file $LOCAL_FILE --github_env
+
+      - name: Display uploaded file end date
+        shell: bash
+        id: set-end-date
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${LATEST_DATE:-}" ]]; then
+            echo "::error title=Missing latest date::LATEST_DATE was not populated from the feature data"
+            exit 1
+          fi
+
+          if [[ -z "${MATERIALIZATION_END_DATE:-}" ]]; then
+            echo "::error title=Missing materialization end date::MATERIALIZATION_END_DATE was not populated"
+            exit 1
+          fi
+
+          echo "Latest CSV date:     $LATEST_DATE"
+          echo "Required materialization end date:  $MATERIALIZATION_END_DATE"
+
+          echo "latestdate=$LATEST_DATE" >> "$GITHUB_OUTPUT"
+          echo "end-date=$MATERIALIZATION_END_DATE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Feature data download"
+            echo
+            echo "### Downloaded file"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| File | \`$LOCAL_FILE\` |"
+            echo "| File size | \`${FEATURE_DATA_FILE_SIZE:-unknown}\` |"
+            echo "| Data rows | \`${FEATURE_DATA_ROW_COUNT:-unknown}\` |"
+            echo
+            echo "### Date range"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Latest CSV date | \`$LATEST_DATE\` |"
+            echo "| Materialization end date | \`$MATERIALIZATION_END_DATE\` |"
+            echo
+            echo "Feature data is ready to be uploaded to the production workspace."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload feature data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature_data_artifact
+          path: ./downloaded-feature-data/walmart_materialized_features_all_weeks.csv
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+
+  download-test-data:
+    name: Download test data from test workspace
+    runs-on: ubuntu-latest
+    needs: check-data-version
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.check-data-version.outputs.test-data-version-exists == 'false'}}
+    steps:
+
+      - name: Check out workflow actions and scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.TEST_AZURE_SECRET }}
+
+      - name: Download test data from test workspace
+        env:
+          ASSET_NAME: ${{ env.TEST_DATA }}
+          ASSET_VERSION: ${{ env.PROMOTED_DATA_VERSION }}
+          SOURCE_RG: ${{ env.TEST_RG }}
+          SOURCE_WORKSPACE_NAME: ${{ env.TEST_WORKSPACE_NAME }}
+          LOCAL_FILE: ./downloaded-test-data/test_data.csv
+          LABEL: "test data"
+        run: .github/scripts/download-data-asset.sh
+
+      - name: Upload test data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_data_artifact
+          path: ./downloaded-test-data/test_data.csv
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+
+  upload-feature-data:
+    name: Upload feature data to production
+    runs-on: ubuntu-latest
+    needs: [download-feature-data, check-data-version]
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.check-data-version.outputs.feature-data-version-exists == 'false'}}
+    steps:
+
+      - name: Check out workflow actions and scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Download artifacts from test job
+        uses: actions/download-artifact@v4
+        with:
+          name: feature_data_artifact
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Upload feature data to production workspace
+        env:
+          ASSET_NAME: ${{ env.FEATURE_DATA_ASSET_NAME }}
+          ASSET_VERSION: ${{ env.PROMOTED_DATA_VERSION }}
+          DATA_FILE: walmart_materialized_features_all_weeks.csv
+          LABEL: "feature data"
+        run: .github/scripts/upload-data-asset.sh
+
+  upload-test-data:
+    name: Upload test data to production
+    runs-on: ubuntu-latest
+    needs: [download-test-data, check-data-version]
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.check-data-version.outputs.test-data-version-exists == 'false'}}
+    steps:
+
+      - name: Check out workflow actions and scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Download artifacts from test job
+        uses: actions/download-artifact@v4
+        with:
+          name: test_data_artifact
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Upload test data to production workspace
+        env:
+          ASSET_NAME: ${{ env.TEST_DATA }}
+          ASSET_VERSION: ${{ env.PROMOTED_DATA_VERSION }}
+          DATA_FILE: ./test_data.csv
+          LABEL: "test data"
+        run: .github/scripts/upload-data-asset.sh
+
+  update-rt-endpoint:
+    name: Update real-time endpoint to production
+    runs-on: ubuntu-latest
+    needs: [upload-model, upload-feature-data, upload-test-data, download-feature-data]
+    if: ${{ always() && !failure() && !cancelled() && github.ref == 'refs/heads/main' }}
+    env:
+      RT_DEPLOYMENT_YAML: azureml/rt-deployment.yaml
+      LATEST_PROCESSED_DATE: ${{ needs.download-feature-data.outputs.latest-processed-date }}
+    outputs:
+      rt_endpoint_name: ${{ steps.get-rt-endpoint.outputs.name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Find real-time endpoint
+        id: get-rt-endpoint
+        uses: ./.github/actions/find-endpoint
+        with:
+          type: online
+          prefix: ${{ env.RT_ENDPOINT_PREFIX }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}
+          env-var: RT_ENDPOINT_NAME
+
+      - name: Create deployment
+        id: create-rt-endpoint-deployment
+        env:
+          MODEL_VERSION: ${{ env.PROMOTED_MODEL_VERSION }}
+          FEATURE_DATA_ASSET_VERSION: ${{ env.PROMOTED_DATA_VERSION }}
+        run: .github/scripts/create-rt-deployment.sh
+
+      - name: Test real-time endpoint
+        uses: ./.github/actions/test-rt-endpoint
+        with:
+          endpoint-name: ${{ env.RT_ENDPOINT_NAME }}
+          deployment-name: ${{ env.RT_DEPLOYMENT_NAME }}
+          request-date: ${{ env.LATEST_PROCESSED_DATE }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}
+
+      - name: Send all traffic to the new deployment
+        uses: ./.github/actions/update-rt-traffic
+        with:
+          endpoint-name: ${{ env.RT_ENDPOINT_NAME }}
+          deployment-name: ${{ env.RT_DEPLOYMENT_NAME }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}
+
+      - name: Create realtime deployment summary
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Realtime endpoint refresh"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`$RT_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$RT_DEPLOYMENT_NAME\` |"
+            echo "| Model | \`${MODEL_NAME}:${PROMOTED_MODEL_VERSION}\` |"
+            echo "| Feature data | \`${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION}\` |"
+            echo "| Test date | \`$LATEST_PROCESSED_DATE\` |"
+            echo "| Traffic | \`100%\` |"
+            echo
+            echo "New realtime deployment created, tested, and promoted to 100% traffic."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  update-batch-endpoint:
+    name: Update batch endpoint model to production
+    runs-on: ubuntu-latest
+    needs: [upload-model, upload-feature-data, upload-test-data, download-feature-data]
+    if: ${{ always() && !failure() && !cancelled() && github.ref == 'refs/heads/main' }}
+    env:
+      BATCH_DEPLOYMENT_YAML: azureml/batch-endpoint-deployment.yaml
+      LATEST_PROCESSED_DATE: ${{ needs.download-feature-data.outputs.latest-processed-date }}
+    outputs:
+      batch_endpoint_name: ${{ steps.get-batch-endpoint.outputs.name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Set up Python and install walmart_ml
+        uses: ./.github/actions/python-setup
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Find batch endpoint
+        id: get-batch-endpoint
+        uses: ./.github/actions/find-endpoint
+        with:
+          type: batch
+          prefix: ${{ env.BATCH_ENDPOINT_PREFIX }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}
+          env-var: BATCH_ENDPOINT_NAME
+
+      - name: Create deployment
+        id: create_batch_deployment
+        run: |
+          set -euo pipefail
+          TIMESTAMP="$(date -u +'%Y%m%d-%H%M%S')"
+          BATCH_DEPLOYMENT_NAME="batch-deployment-$TIMESTAMP"
+          BATCH_DEPLOYMENT_DESC="XGBoost walmart sales batch deployment"
+          COMPUTE_NAME="${{ vars.PROD_PREFIX }}-compute"
+          SCORE_SCRIPT="batch.py"
+          echo "BATCH_DEPLOYMENT_NAME=$BATCH_DEPLOYMENT_NAME" >> $GITHUB_ENV
+          echo "batch_deployment_name=$BATCH_DEPLOYMENT_NAME" >> "$GITHUB_OUTPUT"
+
+          FEATURE_DATA_ASSET_VERSION=$PROMOTED_DATA_VERSION
+          MODEL_VERSION=$PROMOTED_MODEL_VERSION
+
+          echo "::group::Resolve and verify Azure resources"
+          SUBSCRIPTION_ID="$(
+            az account show \
+              --query id \
+              --output tsv
+          )"
+
+          if [[ -z "$SUBSCRIPTION_ID" ]]; then
+            echo "::error::Could not determine the Azure subscription ID."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Render batch deployment YAML"
+
+          export BATCH_DEPLOYMENT_NAME BATCH_DEPLOYMENT_DESC COMPUTE_NAME SCORE_SCRIPT SUBSCRIPTION_ID FEATURE_DATA_ASSET_VERSION MODEL_VERSION
+          envsubst '${BATCH_DEPLOYMENT_NAME} ${BATCH_DEPLOYMENT_DESC} ${BATCH_ENDPOINT_NAME} ${MODEL_NAME} ${MODEL_VERSION} ${COMPUTE_NAME} ${ENDPOINT_ENVIRONMENT} ${SUBSCRIPTION_ID} ${RG} ${WORKSPACE_NAME} ${FEATURE_DATA_ASSET_NAME} ${FEATURE_DATA_ASSET_VERSION} ${SCORE_SCRIPT}' < azureml/batch-deployment-template.yaml > $BATCH_DEPLOYMENT_YAML
+
+          if [[ ! -f "$BATCH_DEPLOYMENT_YAML" ]]; then
+            echo "::error title=Missing file::Batch endpoint deployment YAML not found at: $BATCH_DEPLOYMENT_YAML"
+            exit 1
+          fi
+
+          cat $BATCH_DEPLOYMENT_YAML
+          echo "::endgroup::"
+
+          echo "::group::Create Azure ML batch deployment"
+          # --set-default # causes breakage
+          BATCH_DEPLOYMENT_JSON=$(az ml batch-deployment create --resource-group "$RG" --workspace-name "$WORKSPACE_NAME" --file "$BATCH_DEPLOYMENT_YAML")
+
+          BATCH_DEPLOYMENT_STATE=$(echo "$BATCH_DEPLOYMENT_JSON" | jq -r '.provisioning_state')
+
+          if [[ "$BATCH_DEPLOYMENT_STATE" == "Succeeded" ]]; then
+              echo "Batch deployment '$BATCH_DEPLOYMENT_NAME' created successfully in resource group '$RG'"
+          else
+              echo "Failed to create batch deployment '$BATCH_DEPLOYMENT_NAME' (provisioningState: $BATCH_DEPLOYMENT_STATE)"
+              exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Run batch endpoint job
+        id: batch_job
+        timeout-minutes: 75
+        uses: ./.github/actions/run-batch-job
+        with:
+          endpoint-name: ${{ env.BATCH_ENDPOINT_NAME }}
+          deployment-name: ${{ env.BATCH_DEPLOYMENT_NAME }}
+          input: azureml:test_data:${{ env.PROMOTED_DATA_VERSION }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}
+          timeout-minutes: ${{ env.AML_JOB_TIMEOUT_MINUTES }}
+
+      - name: Validate batch job output
+        id: validate_batch_output
+        uses: ./.github/actions/validate-batch-output
+        with:
+          job-name: ${{ steps.batch_job.outputs.job-name }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}
+
+      - name: Set batch deployment as default
+        id: set_default
+        uses: ./.github/actions/set-default-batch-deployment
+        with:
+          endpoint-name: ${{ env.BATCH_ENDPOINT_NAME }}
+          deployment-name: ${{ env.BATCH_DEPLOYMENT_NAME }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}
+
+      - name: Write batch deployment summary
+        env:
+          BATCH_JOB_NAME: ${{ steps.batch_job.outputs.job-name }}
+          PREVIOUS_DEFAULT: ${{ steps.set_default.outputs.previous-default }}
+          CURRENT_DEFAULT: ${{ steps.set_default.outputs.current-default }}
+        run: |
+          {
+            echo "## Batch endpoint deployment"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`$BATCH_ENDPOINT_NAME\` |"
+            echo "| Deployment | \`$BATCH_DEPLOYMENT_NAME\` |"
+            echo "| Deployment state | \`Succeeded\` |"
+            echo "| Model | \`${MODEL_NAME}:${PROMOTED_MODEL_VERSION}\` |"
+            echo "| Feature data | \`${FEATURE_DATA_ASSET_NAME}:${PROMOTED_DATA_VERSION}\` |"
+            echo "| Test-data version | \`$PROMOTED_DATA_VERSION\` |"
+            echo "| Batch job | \`$BATCH_JOB_NAME\` |"
+            echo "| Prediction rows | \`${{ steps.validate_batch_output.outputs.prediction_count }}\` |"
+            echo "| Previous default | \`${PREVIOUS_DEFAULT:-none}\` |"
+            echo "| Current default | \`$CURRENT_DEFAULT\` |"
+            echo
+            echo "## Generated reports"
+            echo
+            echo "| Report | Artifact |"
+            echo "|---|---|"
+            echo "| Batch predictions | \`batch-predictions-${{ github.run_id }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload batch predictions
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-predictions-${{ github.run_id }}
+          path: batch-results/
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+
+  delete-orphan-deployments:
+    name: Delete old deployments
+    runs-on: ubuntu-latest
+    if: ${{ always() && !failure() && !cancelled() && github.ref == 'refs/heads/main' }}
+    needs: [update-rt-endpoint, update-batch-endpoint]
+    env:
+      BATCH_ENDPOINT_NAME: ${{ needs.update-batch-endpoint.outputs.batch_endpoint_name }}
+      RT_ENDPOINT_NAME: ${{ needs.update-rt-endpoint.outputs.rt_endpoint_name }}
+    steps:
+      - name: Check out workflow actions and scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Set up Azure CLI
+        uses: ./.github/actions/azure-setup
+        with:
+          creds: ${{ secrets.PROD_AZURE_SECRET }}
+
+      - name: Delete real-time deployments with no traffic
+        uses: ./.github/actions/delete-orphan-rt-deployments
+        with:
+          endpoint-name: ${{ env.RT_ENDPOINT_NAME }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}
+
+      - name: Delete non-default batch deployments
+        uses: ./.github/actions/delete-non-default-batch-deployments
+        with:
+          endpoint-name: ${{ env.BATCH_ENDPOINT_NAME }}
+          resource-group: ${{ env.RG }}
+          workspace-name: ${{ env.WORKSPACE_NAME }}

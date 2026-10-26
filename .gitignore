@@ -1,0 +1,24 @@
+__pycache__/
+.idea
+.DS_Store
+tmp
+logs
+.venv/
+/mlruns/
+/tmp/
+
+# Generated reports and outputs
+/outputs/
+/reports/
+/locust/*.json
+
+# Test and coverage outputs
+/.pytest_cache/
+/.coverage
+/htmlcov/
+coverage.xml
+junit.xml
+# Packaging
+*.egg-info/
+build/
+dist/

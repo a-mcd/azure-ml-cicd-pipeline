@@ -1,0 +1,36 @@
+name: Wait for Azure ML job
+description: >-
+  Stream an Azure ML job's logs, then poll until it finishes. Fails if the job
+  fails, and cancels it if it runs longer than the timeout.
+
+inputs:
+  job-name:
+    description: Azure ML job name.
+    required: true
+  resource-group:
+    description: Resource group of the workspace.
+    required: true
+  workspace-name:
+    description: Azure ML workspace that runs the job.
+    required: true
+  timeout-minutes:
+    description: Minutes to wait before cancelling the job.
+    required: false
+    default: "60"
+  description:
+    description: What the job does, used in log and error messages.
+    required: false
+    default: Azure ML job
+
+runs:
+  using: composite
+  steps:
+    - name: Wait for job
+      shell: bash
+      env:
+        JOB_NAME: ${{ inputs.job-name }}
+        RG: ${{ inputs.resource-group }}
+        WORKSPACE_NAME: ${{ inputs.workspace-name }}
+        TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        JOB_DESCRIPTION: ${{ inputs.description }}
+      run: ${{ github.action_path }}/wait.sh

@@ -1,0 +1,39 @@
+name: Find endpoint
+description: Find the real-time or batch endpoint whose name starts with a prefix.
+
+inputs:
+  type:
+    description: '"online" for a real-time endpoint, or "batch".'
+    required: true
+  prefix:
+    description: Endpoint name prefix.
+    required: true
+  resource-group:
+    description: Resource group of the workspace.
+    required: true
+  workspace-name:
+    description: Azure ML workspace holding the endpoint.
+    required: true
+  env-var:
+    description: If set, also save the name to this environment variable for later steps.
+    required: false
+    default: ""
+
+outputs:
+  name:
+    description: Name of the endpoint. The first in sorted order if several match.
+    value: ${{ steps.find.outputs.name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Find endpoint
+      id: find
+      shell: bash
+      env:
+        ENDPOINT_TYPE: ${{ inputs.type }}
+        ENDPOINT_PREFIX: ${{ inputs.prefix }}
+        RG: ${{ inputs.resource-group }}
+        WORKSPACE_NAME: ${{ inputs.workspace-name }}
+        ENV_VAR: ${{ inputs.env-var }}
+      run: ${{ github.action_path }}/find-endpoint.sh

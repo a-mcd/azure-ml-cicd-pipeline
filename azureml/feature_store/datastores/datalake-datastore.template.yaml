@@ -1,0 +1,8 @@
+$schema: https://azuremlschemas.azureedge.net/latest/azureDataLakeGen2.schema.json
+
+name: walmart_datalake
+type: azure_data_lake_gen2
+description: Walmart ADLS Gen2 datastore
+
+account_name: ${STORAGE_ACCOUNT}
+filesystem: walmart-source

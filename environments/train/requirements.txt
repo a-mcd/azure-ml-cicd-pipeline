@@ -1,0 +1,24 @@
+# Azure ML training image (built from this folder's Dockerfile).
+#
+# Versions of packages that also appear in pyproject.toml must match it
+# exactly; tests/unit/test_dependency_pins.py enforces this.
+# Rebuild and re-register the training environment after changing this file.
+
+# ==========================
+# Same pins as pyproject.toml
+# ==========================
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.2
+xgboost==2.1.1
+mlflow==2.16.2
+matplotlib==3.9.2
+azure-ai-ml==1.32.0
+azure-identity==1.17.0
+
+# ==========================
+# Azure ML only
+# ==========================
+azureml-mlflow==1.62.0.post2
+protobuf==3.20.3
+googleapis-common-protos<1.62.0   # avoids pulling protobuf>=4

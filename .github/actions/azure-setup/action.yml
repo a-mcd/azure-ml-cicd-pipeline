@@ -1,0 +1,30 @@
+name: Azure setup
+description: Sign in to Azure, show the active account, and install the Azure ML CLI extension.
+
+inputs:
+  creds:
+    description: Service principal credentials JSON for azure/login.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Login into Azure
+      uses: azure/login@v2
+      with:
+        creds: ${{ inputs.creds }}
+
+    - name: Show Azure account
+      shell: bash
+      run: |
+        set -euo pipefail
+        az account show \
+          --query "{subscription:name, subscriptionId:id, user:user.name}" \
+          --output table
+
+    - name: Install Azure ML CLI extension
+      shell: bash
+      run: |
+        set -euo pipefail
+        az extension add --name ml --upgrade --yes --only-show-errors
+        az extension show --name ml --query "{extension:name, version:version}" --output table

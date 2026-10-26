@@ -1,0 +1,7 @@
+# workspace.template.yaml
+name: ${WORKSPACE_NAME}
+location: ${LOCATION}
+tags:
+  env: ${ENV}
+  owner: ${OWNER}
+container_registry: ${CONTAINER_REGISTRY_ID}

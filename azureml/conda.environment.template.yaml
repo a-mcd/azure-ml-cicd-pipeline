@@ -1,0 +1,8 @@
+$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+name: ${ENDPOINT_ENVIRONMENT_NAME}
+conda_file: ../environments/endpoint/conda.yml
+description: Environment built from a custom conda.
+# Pinned by digest so a rebuild cannot pull a different base image. This is
+# the image the current endpoint environment was built from (from its build
+# log). The curated image runs Python 3.12, matching CI.
+image: mcr.microsoft.com/azureml/curated/mlflow-py312-inference@sha256:b23c0d7c6137cd3bbe4601bf11c290042679955a8ff518b872b8cc4d18d418cb

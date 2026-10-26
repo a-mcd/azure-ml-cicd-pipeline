@@ -1,0 +1,37 @@
+name: Set default batch deployment
+description: Make a deployment the batch endpoint's default and check that it took effect.
+
+inputs:
+  endpoint-name:
+    description: Batch endpoint name.
+    required: true
+  deployment-name:
+    description: Deployment to make the default.
+    required: true
+  resource-group:
+    description: Resource group of the workspace.
+    required: true
+  workspace-name:
+    description: Azure ML workspace holding the endpoint.
+    required: true
+
+outputs:
+  previous-default:
+    description: Default deployment before the change, or "none".
+    value: ${{ steps.set.outputs.previous-default }}
+  current-default:
+    description: Default deployment after the change.
+    value: ${{ steps.set.outputs.current-default }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set default deployment
+      id: set
+      shell: bash
+      env:
+        BATCH_ENDPOINT_NAME: ${{ inputs.endpoint-name }}
+        BATCH_DEPLOYMENT_NAME: ${{ inputs.deployment-name }}
+        RG: ${{ inputs.resource-group }}
+        WORKSPACE_NAME: ${{ inputs.workspace-name }}
+      run: ${{ github.action_path }}/set-default-batch-deployment.sh

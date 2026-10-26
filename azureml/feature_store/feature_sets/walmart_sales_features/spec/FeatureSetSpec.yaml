@@ -1,0 +1,222 @@
+$schema: http://azureml/sdk-2-0/FeatureSetSpec.json
+
+source:
+  type: csv
+  path: ${SOURCE_DATA_URI}
+  
+  timestamp_column:
+    name: Date
+    format: dd-MM-yyyy
+
+  source_delay:
+    days: 0
+    hours: 0
+    minutes: 0
+
+feature_transformation_code:
+  path: ./transformation_code
+  transformer_class: walmart_transformer.WalmartFeatureTransformer
+
+features:
+  - name: Temperature
+    type: double
+
+  - name: Fuel_Price
+    type: double
+
+  - name: CPI
+    type: double
+
+  - name: Unemployment
+    type: double
+
+  - name: lag_1
+    type: double
+
+  - name: lag_2
+    type: double
+
+  - name: lag_52
+    type: double
+
+  - name: rollmean_3
+    type: double
+
+  - name: rollmean_6
+    type: double
+
+  - name: rollmean_12
+    type: double
+
+  - name: month
+    type: integer
+
+  - name: week
+    type: integer
+
+  - name: quarter
+    type: integer
+
+  - name: year
+    type: integer
+
+  - name: S_1
+    type: boolean
+
+  - name: S_2
+    type: boolean
+
+  - name: S_3
+    type: boolean
+
+  - name: S_4
+    type: boolean
+
+  - name: S_5
+    type: boolean
+
+  - name: S_6
+    type: boolean
+
+  - name: S_7
+    type: boolean
+
+  - name: S_8
+    type: boolean
+
+  - name: S_9
+    type: boolean
+
+  - name: S_10
+    type: boolean
+
+  - name: S_11
+    type: boolean
+
+  - name: S_12
+    type: boolean
+
+  - name: S_13
+    type: boolean
+
+  - name: S_14
+    type: boolean
+
+  - name: S_15
+    type: boolean
+
+  - name: S_16
+    type: boolean
+
+  - name: S_17
+    type: boolean
+
+  - name: S_18
+    type: boolean
+
+  - name: S_19
+    type: boolean
+
+  - name: S_20
+    type: boolean
+
+  - name: S_21
+    type: boolean
+
+  - name: S_22
+    type: boolean
+
+  - name: S_23
+    type: boolean
+
+  - name: S_24
+    type: boolean
+
+  - name: S_25
+    type: boolean
+
+  - name: S_26
+    type: boolean
+
+  - name: S_27
+    type: boolean
+
+  - name: S_28
+    type: boolean
+
+  - name: S_29
+    type: boolean
+
+  - name: S_30
+    type: boolean
+
+  - name: S_31
+    type: boolean
+
+  - name: S_32
+    type: boolean
+
+  - name: S_33
+    type: boolean
+
+  - name: S_34
+    type: boolean
+
+  - name: S_35
+    type: boolean
+
+  - name: S_36
+    type: boolean
+
+  - name: S_37
+    type: boolean
+
+  - name: S_38
+    type: boolean
+
+  - name: S_39
+    type: boolean
+
+  - name: S_40
+    type: boolean
+
+  - name: S_41
+    type: boolean
+
+  - name: S_42
+    type: boolean
+
+  - name: S_43
+    type: boolean
+
+  - name: S_44
+    type: boolean
+
+  - name: S_45
+    type: boolean
+
+  - name: Holiday_Christmas
+    type: boolean
+
+  - name: Holiday_Thanksgiving
+    type: boolean
+
+  - name: Holiday_Labor_Day
+    type: boolean
+
+  - name: Holiday_Super_Bowl
+    type: boolean
+
+index_columns:
+  - name: Store
+    type: integer
+
+source_lookback:
+  days: 371
+  hours: 0
+  minutes: 0
+
+temporal_join_lookback:
+  days: 8
+  hours: 0
+  minutes: 0

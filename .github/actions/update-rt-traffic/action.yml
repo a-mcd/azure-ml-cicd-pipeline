@@ -1,0 +1,39 @@
+name: Update real-time traffic
+description: >-
+  Send 100% of a real-time endpoint's traffic to one deployment, check the
+  result, and write the change to the job summary.
+
+inputs:
+  endpoint-name:
+    description: Real-time endpoint name.
+    required: true
+  deployment-name:
+    description: Deployment that should receive all traffic.
+    required: true
+  resource-group:
+    description: Resource group of the workspace.
+    required: true
+  workspace-name:
+    description: Azure ML workspace holding the endpoint.
+    required: true
+
+outputs:
+  previous-traffic:
+    description: Traffic allocation before the update, as compact JSON.
+    value: ${{ steps.update.outputs.previous-traffic }}
+  current-traffic:
+    description: Traffic allocation after the update, as compact JSON.
+    value: ${{ steps.update.outputs.current-traffic }}
+
+runs:
+  using: composite
+  steps:
+    - name: Update traffic
+      id: update
+      shell: bash
+      env:
+        RT_ENDPOINT_NAME: ${{ inputs.endpoint-name }}
+        RT_DEPLOYMENT_NAME: ${{ inputs.deployment-name }}
+        RG: ${{ inputs.resource-group }}
+        WORKSPACE_NAME: ${{ inputs.workspace-name }}
+      run: ${{ github.action_path }}/update-rt-traffic.sh

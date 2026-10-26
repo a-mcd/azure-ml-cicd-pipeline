@@ -1,0 +1,23 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+# Builds the engineered-feature CSV with the training feature code, as a
+# fallback when feature-store materialization is unavailable.
+# Rendered by setup_scripts/env_setup.sh into tmp/, so code: ../src is the
+# repository's src folder.
+code: ../src
+command: >
+  PYTHONPATH=. python -m walmart_ml.pipeline.build_engineered_features
+  --source ${{inputs.source_data}}
+  --output-dir ${{outputs.engineered_features}}
+inputs:
+  source_data:
+    type: uri_file
+    path: ${SOURCE_DATA_URI}
+    mode: ro_mount
+outputs:
+  engineered_features:
+    type: uri_folder
+environment: azureml:${TRAINING_ENVIRONMENT}
+compute: azureml:${COMPUTE_NAME}
+experiment_name: ${EXPERIMENT_NAME}
+display_name: build-engineered-features
+description: Build walmart_materialized_features without the feature store.

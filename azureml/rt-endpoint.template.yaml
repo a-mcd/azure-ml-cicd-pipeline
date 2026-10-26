@@ -1,0 +1,7 @@
+$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineEndpoint.schema.json
+auth_mode: key
+identity:
+  type: system_assigned
+mirror_traffic: {}
+name: ${RT_ENDPOINT_NAME}
+public_network_access: enabled

@@ -1,0 +1,38 @@
+name: Validate batch output
+description: Download a batch job's predictions and check them with validate_predictions.py.
+
+inputs:
+  job-name:
+    description: Batch scoring job name.
+    required: true
+  resource-group:
+    description: Resource group of the workspace.
+    required: true
+  workspace-name:
+    description: Azure ML workspace holding the endpoint.
+    required: true
+  download-path:
+    description: Folder to download the predictions into.
+    required: false
+    default: batch-results
+
+outputs:
+  prediction_count:
+    description: Number of prediction rows.
+    value: ${{ steps.validate.outputs.prediction_count }}
+  predictions-file:
+    description: Path of the downloaded predictions file.
+    value: ${{ steps.validate.outputs.predictions-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download and validate predictions
+      id: validate
+      shell: bash
+      env:
+        BATCH_JOB_NAME: ${{ inputs.job-name }}
+        RG: ${{ inputs.resource-group }}
+        WORKSPACE_NAME: ${{ inputs.workspace-name }}
+        DOWNLOAD_PATH: ${{ inputs.download-path }}
+      run: ${{ github.action_path }}/validate-batch-output.sh

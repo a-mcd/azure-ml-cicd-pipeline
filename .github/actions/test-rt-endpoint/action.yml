@@ -1,0 +1,49 @@
+name: Test real-time endpoint
+description: >-
+  Send a one-store request to a real-time deployment and check the response.
+  Writes the prediction to the job summary.
+
+inputs:
+  endpoint-name:
+    description: Real-time endpoint name.
+    required: true
+  deployment-name:
+    description: Deployment to send the request to.
+    required: true
+  request-date:
+    description: Feature date to request, in DD-MM-YYYY format.
+    required: true
+  resource-group:
+    description: Resource group of the workspace.
+    required: true
+  workspace-name:
+    description: Azure ML workspace holding the endpoint.
+    required: true
+
+outputs:
+  store:
+    description: Store in the response.
+    value: ${{ steps.test.outputs.store }}
+  feature-date:
+    description: Feature date in the response.
+    value: ${{ steps.test.outputs.feature-date }}
+  prediction-date:
+    description: Date the prediction is for.
+    value: ${{ steps.test.outputs.prediction-date }}
+  predicted-sales:
+    description: Predicted weekly sales.
+    value: ${{ steps.test.outputs.predicted-sales }}
+
+runs:
+  using: composite
+  steps:
+    - name: Send smoke-test request
+      id: test
+      shell: bash
+      env:
+        RT_ENDPOINT_NAME: ${{ inputs.endpoint-name }}
+        RT_DEPLOYMENT_NAME: ${{ inputs.deployment-name }}
+        REQUEST_DATE: ${{ inputs.request-date }}
+        RG: ${{ inputs.resource-group }}
+        WORKSPACE_NAME: ${{ inputs.workspace-name }}
+      run: ${{ github.action_path }}/test-rt-endpoint.sh
