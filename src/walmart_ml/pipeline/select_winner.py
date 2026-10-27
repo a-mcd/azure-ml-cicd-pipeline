@@ -2,8 +2,12 @@
 
 Compares the challenger model's held-out-week forecast with the champion
 endpoint's predictions for the same stores and dates. Metrics are compared in
-order (WAPE, then RMSE, MAPE and MAE), and a difference within a metric's
-tolerance counts as a tie. The champion wins every tie.
+order (WAPE, then RMSE, absolute bias and MAPE), and a difference within a
+metric's tolerance counts as a tie. The champion wins every tie.
+
+MAE and R2 are not used to rank the models. Both models are scored on the
+same week, so MAE always ranks them the same way as WAPE, and R2 the same way
+as RMSE.
 
 The metrics and winner are printed, a Markdown summary is written to
 ``challenger_champion_summary.txt``, and ``winner=<champion|challenger>`` is
@@ -24,10 +28,11 @@ from walmart_ml.training import config
 LOGGER = logging.getLogger(__name__)
 
 
-WAPE_TOLERANCE = 0.01
-RMSE_TOLERANCE = 1.0
-MAPE_TOLERANCE = 0.01
-MAE_TOLERANCE = 1.0
+# Differences within these tolerances count as ties.
+WAPE_TOLERANCE = 0.1  # percentage points
+RMSE_RELATIVE_TOLERANCE = 0.01  # fraction of the champion's RMSE
+BIAS_TOLERANCE = 1.0  # percentage points of total actual sales
+MAPE_TOLERANCE = 0.1  # percentage points
 
 DATE_FORMAT = "%d-%m-%Y"
 
@@ -261,15 +266,18 @@ def calculate_metrics(
     actual: pd.Series,
     predicted: pd.Series,
 ) -> dict[str, float]:
-    """Calculate WAPE, RMSE, MAE and MAPE for one model.
+    """Calculate WAPE, RMSE, MAE, MAPE and bias for one model.
 
     Args:
         actual: Actual next-week sales.
         predicted: Predicted next-week sales.
 
     Returns:
-        dict[str, float]: Metric values keyed ``wape``, ``rmse``, ``mae`` and
-        ``mape``. WAPE and MAPE are percentages.
+        dict[str, float]: Metric values keyed ``wape``, ``rmse``, ``mae``,
+        ``mape``, ``bias`` and ``bias_pct``. WAPE and MAPE are percentages.
+        ``bias`` is the mean of predicted minus actual sales, so a positive
+        value means over-forecasting. ``bias_pct`` is the same total as a
+        percentage of total actual sales.
 
     Raises:
         ValueError: If values are missing, or zero sales make WAPE or MAPE
@@ -308,6 +316,12 @@ def calculate_metrics(
         "mape": float(
             (absolute_errors / actual.abs()).mean() * 100
         ),
+        "bias": float(
+            (-errors).mean()
+        ),
+        "bias_pct": float(
+            (-errors).sum() / actual_total * 100
+        ),
     }
 
 
@@ -318,6 +332,10 @@ def select_winner(
 
     """Pick the better model by comparing metrics in priority order.
 
+    The order is WAPE, RMSE, absolute bias and MAPE. Lower is better for
+    each. A difference within a metric's tolerance counts as a tie and moves
+    on to the next metric, and the champion wins if every metric ties.
+
     Args:
         challenger: Challenger metrics from :func:`calculate_metrics`.
         champion: Champion metrics from :func:`calculate_metrics`.
@@ -326,25 +344,37 @@ def select_winner(
         tuple[str, str]: ``"challenger"`` or ``"champion"``, and the reason.
     """
     comparisons = (
-        ("wape", WAPE_TOLERANCE, "lower WAPE"),
-        ("rmse", RMSE_TOLERANCE, "lower RMSE after WAPE tie"),
         (
-            "mape",
-            MAPE_TOLERANCE,
-            "lower MAPE after WAPE and RMSE tie",
+            challenger["wape"],
+            champion["wape"],
+            WAPE_TOLERANCE,
+            "lower WAPE",
         ),
         (
-            "mae",
-            MAE_TOLERANCE,
-            "lower MAE after other metrics tied",
+            challenger["rmse"],
+            champion["rmse"],
+            champion["rmse"] * RMSE_RELATIVE_TOLERANCE,
+            "lower RMSE after WAPE tie",
+        ),
+        (
+            abs(challenger["bias_pct"]),
+            abs(champion["bias_pct"]),
+            BIAS_TOLERANCE,
+            "lower absolute bias after WAPE and RMSE tie",
+        ),
+        (
+            challenger["mape"],
+            champion["mape"],
+            MAPE_TOLERANCE,
+            "lower MAPE after WAPE, RMSE and bias tie",
         ),
     )
 
     winner = "champion"
     reason = "metrics effectively tied"
 
-    for metric, tolerance, comparison_reason in comparisons:
-        difference = champion[metric] - challenger[metric]
+    for challenger_value, champion_value, tolerance, comparison_reason in comparisons:
+        difference = champion_value - challenger_value
 
         if abs(difference) > tolerance:
             winner = "challenger" if difference > 0 else "champion"
@@ -368,6 +398,7 @@ def print_metrics(
     print(f"{model_name} RMSE: {metrics['rmse']:.2f}")
     print(f"{model_name} MAE:  {metrics['mae']:.2f}")
     print(f"{model_name} MAPE: {metrics['mape']:.4f}%")
+    print(f"{model_name} Bias: {metrics['bias']:.2f} ({metrics['bias_pct']:.4f}%)")
 
 
 def write_summary_file(
@@ -402,6 +433,10 @@ def write_summary_file(
         f"{champion['mae']:.2f} |\n"
         f"| MAPE | {challenger['mape']:.4f}% | "
         f"{champion['mape']:.4f}% |\n"
+        f"| Bias | {challenger['bias']:.2f} ({challenger['bias_pct']:.4f}%) | "
+        f"{champion['bias']:.2f} ({champion['bias_pct']:.4f}%) |\n"
+        "\nModels are ranked by WAPE, then RMSE, absolute bias and MAPE. "
+        "The champion wins ties.\n"
     )
 
     path.write_text(summary, encoding="utf-8")

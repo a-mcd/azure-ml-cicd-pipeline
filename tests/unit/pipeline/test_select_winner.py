@@ -101,6 +101,8 @@ def tied_metrics() -> dict[str, float]:
         "rmse": 100.0,
         "mape": 5.0,
         "mae": 50.0,
+        "bias": 5.0,
+        "bias_pct": 2.0,
     }
 
 
@@ -467,6 +469,18 @@ def test_calculate_metrics_returns_expected_values():
     assert metrics["rmse"] == pytest.approx(19.1485421551)
     assert metrics["mae"] == pytest.approx(16.6666666667)
     assert metrics["mape"] == pytest.approx(8.3333333333)
+    assert metrics["bias"] == pytest.approx(10.0)
+    assert metrics["bias_pct"] == pytest.approx(5.0)
+
+
+def test_calculate_metrics_bias_is_negative_when_under_forecasting():
+    actual = pd.Series([100.0, 200.0])
+    predicted = pd.Series([90.0, 170.0])
+
+    metrics = selection.calculate_metrics(actual, predicted)
+
+    assert metrics["bias"] == pytest.approx(-20.0)
+    assert metrics["bias_pct"] == pytest.approx(-13.3333333333)
 
 
 def test_calculate_metrics_converts_numeric_strings():
@@ -552,15 +566,21 @@ def test_calculate_metrics_rejects_zero_actual_value():
     ),
     [
         (
-            {"wape": 9.98},
+            {"wape": 9.8},
             {},
             "challenger",
             "lower WAPE",
         ),
         (
-            {"wape": 10.02},
+            {"wape": 10.2},
             {},
             "champion",
+            "lower WAPE",
+        ),
+        (
+            {"wape": 9.8, "rmse": 150.0},
+            {},
+            "challenger",
             "lower WAPE",
         ),
         (
@@ -576,28 +596,34 @@ def test_calculate_metrics_rejects_zero_actual_value():
             "lower RMSE after WAPE tie",
         ),
         (
-            {"mape": 4.98},
+            {"bias_pct": 0.5},
             {},
             "challenger",
-            "lower MAPE after WAPE and RMSE tie",
+            "lower absolute bias after WAPE and RMSE tie",
         ),
         (
-            {"mape": 5.02},
-            {},
-            "champion",
-            "lower MAPE after WAPE and RMSE tie",
-        ),
-        (
-            {"mae": 48.0},
+            {"bias_pct": -0.5},
             {},
             "challenger",
-            "lower MAE after other metrics tied",
+            "lower absolute bias after WAPE and RMSE tie",
         ),
         (
-            {"mae": 52.0},
+            {"bias_pct": -3.5},
             {},
             "champion",
-            "lower MAE after other metrics tied",
+            "lower absolute bias after WAPE and RMSE tie",
+        ),
+        (
+            {"mape": 4.8},
+            {},
+            "challenger",
+            "lower MAPE after WAPE, RMSE and bias tie",
+        ),
+        (
+            {"mape": 5.2},
+            {},
+            "champion",
+            "lower MAPE after WAPE, RMSE and bias tie",
         ),
     ],
 )
@@ -638,12 +664,48 @@ def test_select_winner_treats_tolerance_boundary_as_tie(
     challenger = tied_metrics.copy()
     champion = tied_metrics.copy()
 
-    challenger["wape"] = 9.99
+    challenger["wape"] = 9.95
     champion["wape"] = 10.0
 
     winner, reason = selection.select_winner(
         challenger,
         champion,
+    )
+
+    assert winner == "champion"
+    assert reason == "metrics effectively tied"
+
+
+@pytest.mark.parametrize(
+    ("metric", "challenger_value"),
+    [
+        ("rmse", 99.5),
+        ("bias_pct", -2.5),
+        ("mape", 4.95),
+    ],
+)
+def test_select_winner_treats_small_differences_as_ties(
+    tied_metrics,
+    metric,
+    challenger_value,
+):
+    challenger = tied_metrics | {metric: challenger_value}
+
+    winner, reason = selection.select_winner(
+        challenger,
+        tied_metrics.copy(),
+    )
+
+    assert winner == "champion"
+    assert reason == "metrics effectively tied"
+
+
+def test_select_winner_ignores_mae(tied_metrics):
+    challenger = tied_metrics | {"mae": 1.0}
+
+    winner, reason = selection.select_winner(
+        challenger,
+        tied_metrics.copy(),
     )
 
     assert winner == "champion"
@@ -656,6 +718,8 @@ def test_print_metrics_prints_formatted_values(capsys):
         "rmse": 123.456,
         "mae": 100.123,
         "mape": 4.987654,
+        "bias": -12.345,
+        "bias_pct": -1.23456,
     }
 
     selection.print_metrics("Challenger", metrics)
@@ -666,6 +730,7 @@ def test_print_metrics_prints_formatted_values(capsys):
     assert "Challenger RMSE: 123.46" in output
     assert "Challenger MAE:  100.12" in output
     assert "Challenger MAPE: 4.9877%" in output
+    assert "Challenger Bias: -12.35 (-1.2346%)" in output
 
 
 def test_write_summary_file_creates_parent_and_summary(
@@ -678,12 +743,16 @@ def test_write_summary_file_creates_parent_and_summary(
         "rmse": 100.0,
         "mae": 80.0,
         "mape": 4.0,
+        "bias": 10.0,
+        "bias_pct": 1.0,
     }
     champion = {
         "wape": 6.0,
         "rmse": 110.0,
         "mae": 90.0,
         "mape": 5.0,
+        "bias": -20.0,
+        "bias_pct": -2.0,
     }
 
     selection.write_summary_file(
@@ -703,6 +772,8 @@ def test_write_summary_file_creates_parent_and_summary(
     assert "| RMSE | 100.00 | 110.00 |" in summary
     assert "| MAE | 80.00 | 90.00 |" in summary
     assert "| MAPE | 4.0000% | 5.0000% |" in summary
+    assert "| Bias | 10.00 (1.0000%) | -20.00 (-2.0000%) |" in summary
+    assert "ranked by WAPE, then RMSE, absolute bias and MAPE" in summary
     assert f"Summary written to: {path}" in caplog.text
 
 

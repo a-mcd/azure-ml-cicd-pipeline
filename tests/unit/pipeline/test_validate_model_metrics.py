@@ -634,7 +634,10 @@ def test_build_eval_result_builds_expected_result(
         "R2": 0.95,
         "MAPE": 8.0,
         "MAE": 100.0,
+        "RMSE": 150.0,
         "RMSE_RATIO": 1.5,
+        "WAPE": 7.5,
+        "BIAS": 10.0,
     }
 
 
@@ -647,6 +650,8 @@ def test_build_eval_result_uses_lowercase_false_status(
         "MAE": 100.0,
         "RMSE": 250.0,
         "RMSE_RATIO": 2.5,
+        "WAPE": None,
+        "BIAS": None,
     }
 
     result = validation.build_eval_result(
@@ -837,3 +842,43 @@ def test_validate_mlflow_metrics_defaults_missing_optional_metrics(
     assert result["metrics"]["BIAS"] is None
     assert result["metrics"]["WAPE"] is None
     assert result["metrics"]["MEDIAN_AE"] is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("7.5", 7.5),
+        (-3, -3.0),
+    ],
+)
+def test_optional_float_converts_or_keeps_missing(value, expected):
+    assert validation.optional_float(value) == expected
+
+
+def test_build_eval_result_copies_ranking_metrics_to_top_level(
+    valid_params,
+):
+    metrics_result = {
+        "R2": 0.95,
+        "MAPE": 8.0,
+        "MAE": 100.0,
+        "RMSE": 150.0,
+        "RMSE_RATIO": 1.5,
+        "WAPE": 7.5,
+        "BIAS": -10.0,
+    }
+
+    result = validation.build_eval_result(
+        job_name="training-job",
+        purpose="Evaluate model",
+        pass_status=True,
+        metrics_result=metrics_result,
+        params=valid_params,
+    )
+
+    assert result["WAPE"] == 7.5
+    assert result["RMSE"] == 150.0
+    assert result["BIAS"] == -10.0
+    assert result["MAPE"] == 8.0

@@ -221,14 +221,16 @@ The test pipeline checks the code, trains candidate models, compares the best on
    - Saves the metrics and training details for each candidate.
 
 5. **Select and train the challenger**
-   - Picks the best candidate that passed the thresholds.
+   - Picks the best candidate that passed the thresholds, ranked by WAPE, then RMSE, absolute bias and MAPE.
    - Retrains that configuration on all available training data.
    - Produces the challenger model and its forecast for the held-out week.
 
 6. **Run champion–challenger testing**
    - Scores the same week with the current champion through the real-time endpoint.
    - Compares both models' predictions with the actual sales.
-   - Compares WAPE, then RMSE, MAPE and MAE, to pick the winner; the champion wins ties.
+   - Compares WAPE, then RMSE, absolute bias and MAPE, to pick the winner. Small differences count as ties (0.1 percentage points of WAPE or MAPE, 1% of the champion's RMSE, 1 percentage point of bias), and the champion wins ties.
+
+   Both stages use the same order. WAPE measures total error as a share of total sales, so large stores count more. RMSE then favours the model with fewer large misses, absolute bias the one that is not consistently over- or under-forecasting, and MAPE the one that is fairer to small stores. MAE and R² are only used as pass/fail thresholds: on the same test data, MAE always ranks models the same way as WAPE, and R² the same way as RMSE.
 
 7. **Register the challenger**
    - Registers the challenger in Azure Machine Learning.

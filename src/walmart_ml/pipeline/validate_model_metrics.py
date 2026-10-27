@@ -38,6 +38,21 @@ def mlflow_items_to_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def optional_float(value: Any) -> float | None:
+    """Convert a metric value to a float, keeping missing values as ``None``.
+
+    Args:
+        value: Metric value from MLflow, which may be missing or empty.
+
+    Returns:
+        float | None: The value as a float, or ``None`` if it is missing.
+    """
+    if value in ("", None):
+        return None
+
+    return float(value)
+
+
 def run_command(command: list[str]) -> str:
     """Run a command without a shell and return its stdout.
 
@@ -218,9 +233,9 @@ def validate_model_metrics(
         "MAE": mae,
         "RMSE": rmse,
         "RMSE_RATIO": rmse_ratio,
-        "BIAS": metrics.get("Bias"),
-        "WAPE": metrics.get("WAPE"),
-        "MEDIAN_AE": metrics.get("Median_AE"),
+        "BIAS": optional_float(metrics.get("Bias")),
+        "WAPE": optional_float(metrics.get("WAPE")),
+        "MEDIAN_AE": optional_float(metrics.get("Median_AE")),
     }
 
     return all(checks), metrics_result
@@ -243,7 +258,9 @@ def build_eval_result(
         params: MLflow params, including the XGBoost hyperparameters.
 
     Returns:
-        dict[str, Any]: Result with status, hyperparameters and metrics.
+        dict[str, Any]: Result with status, hyperparameters and metrics. The
+        ranking metrics (WAPE, RMSE, BIAS and MAPE) are also copied to the top
+        level so the workflow can sort candidates with ``jq``.
     """
     return {
         "job_name": job_name,
@@ -262,7 +279,10 @@ def build_eval_result(
         "R2": metrics_result["R2"],
         "MAPE": metrics_result["MAPE"],
         "MAE": metrics_result["MAE"],
+        "RMSE": metrics_result["RMSE"],
         "RMSE_RATIO": metrics_result["RMSE_RATIO"],
+        "WAPE": metrics_result["WAPE"],
+        "BIAS": metrics_result["BIAS"],
     }
 
 

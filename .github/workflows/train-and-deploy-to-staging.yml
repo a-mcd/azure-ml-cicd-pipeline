@@ -729,15 +729,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Rank passing candidates by WAPE, then RMSE, then absolute bias,
+          # then MAPE (the same order as the champion-challenger test).
+          # Missing values sort last.
           jq -s '
           map(
-            .R2 |= (try tonumber catch 0) |
-            .MAPE |= (try tonumber catch 1e9) |
-            .MAE |= (try tonumber catch 1e18) |
-            .RMSE_RATIO |= (try tonumber catch 1e9)
+            .WAPE |= (try tonumber catch 1e18) |
+            .RMSE |= (try tonumber catch 1e18) |
+            .BIAS |= (try tonumber catch 1e18) |
+            .MAPE |= (try tonumber catch 1e18)
           )
           | [ .[] | select((.status|tostring)=="true") ]
-          | sort_by([ .RMSE_RATIO, .MAPE, .MAE, -(.R2) ])
+          | sort_by([ .WAPE, .RMSE, (.BIAS | if . < 0 then -. else . end), .MAPE ])
           | .[0]
           ' training_jobs/*.json > winner.json
 
@@ -750,6 +753,9 @@ jobs:
           COLSAMPLE_BYTREE=$(jq -r '.hyperparameters.colsample_bytree' winner.json)
           REG_ALPHA=$(jq -r '.hyperparameters.reg_alpha' winner.json)
           REG_LAMBDA=$(jq -r '.hyperparameters.reg_lambda' winner.json)
+          WAPE="$(jq -r '.metrics.WAPE' winner.json)"
+          RMSE="$(jq -r '.metrics.RMSE' winner.json)"
+          BIAS="$(jq -r '.metrics.BIAS' winner.json)"
           R2="$(jq -r '.metrics.R2' winner.json)"
           MAPE="$(jq -r '.metrics.MAPE' winner.json)"
           MAE="$(jq -r '.metrics.MAE' winner.json)"
@@ -765,6 +771,9 @@ jobs:
           echo "reg_lambda=$REG_LAMBDA" >> "$GITHUB_OUTPUT"
 
           echo "Best performer: $BEST_PERFORMER"
+          echo "WAPE: $WAPE"
+          echo "RMSE: $RMSE"
+          echo "Bias: $BIAS"
           echo "R2: $R2"
           echo "MAPE: $MAPE"
           echo "MAE: $MAE"
@@ -787,8 +796,13 @@ jobs:
             echo
             echo "### Validation metrics"
             echo
+            echo "Ranked by WAPE, then RMSE, then absolute bias, then MAPE."
+            echo
             echo "| Metric | Value |"
             echo "|---|---:|"
+            echo "| WAPE | \`$WAPE\` |"
+            echo "| RMSE | \`$RMSE\` |"
+            echo "| Bias | \`$BIAS\` |"
             echo "| R2 | \`$R2\` |"
             echo "| MAPE | \`$MAPE\` |"
             echo "| MAE | \`$MAE\` |"
